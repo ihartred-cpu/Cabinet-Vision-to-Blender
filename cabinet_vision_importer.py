@@ -29,6 +29,12 @@ def _log(*args):
 def _strip(url):
     return url.strip().lstrip("#") if url else ""
 
+def _cv_part_name(raw):
+    """Extract CV part-type code from a library_node name like 'N_TO-Sh3cc841e0_...'."""
+    if raw.startswith("N_") and "-" in raw:
+        return raw[2:raw.index("-")]
+    return raw
+
 # ──────────────────────────────────────────────────────────────
 #  Parser
 # ──────────────────────────────────────────────────────────────
@@ -250,7 +256,7 @@ class DAEParser:
 
     def _parse_node(self, node_el):
         nid   = node_el.get("id","")
-        name  = node_el.get("name", nid) or nid or "Node"
+        name  = _cv_part_name(node_el.get("name", nid) or nid or "Node")
         mat   = self._node_matrix(node_el)
         ginst = []
         for ig in self._all(node_el, "instance_geometry"):
