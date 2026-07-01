@@ -332,7 +332,14 @@ class BlenderBuilder:
         return None
 
     def _make_mat(self, mid, md):
-        mat = bpy.data.materials.new(name=md.get("name", mid))
+        # Prefer the image filename stem (e.g. "BCW_MAPLE_cee3ec") as the
+        # material name; fall back to the DAE material name or id.
+        tp = md.get("texture_path")
+        if tp:
+            mat_name = os.path.splitext(os.path.basename(tp))[0]
+        else:
+            mat_name = md.get("name") or mid
+        mat = bpy.data.materials.new(name=mat_name)
         mat.use_nodes = True
         nodes = mat.node_tree.nodes
         links = mat.node_tree.links
