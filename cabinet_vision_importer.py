@@ -35,6 +35,10 @@ def _cv_part_name(raw):
         return raw[2:raw.index("-")]
     return raw
 
+# CV bore/hardware objects whose holes are tessellated into the panel faces.
+# These separate floating cylinders are moved to a hidden "Bores" collection.
+_BORE_PART_TYPES = frozenset()  # All bore objects import as normal visible objects
+
 # ──────────────────────────────────────────────────────────────
 #  Parser
 # ──────────────────────────────────────────────────────────────
@@ -373,9 +377,34 @@ class BlenderBuilder:
             bsdf.inputs["Base Color"].default_value = md.get("color",(0.8,0.8,0.8,1.0))
         return mat
 
+    def _get_bore_col(self, scene_col):
+        """Return (creating if needed) a hidden 'Bores' collection."""
+        col = bpy.data.collections.get("Bores")
+        if col is None:
+            col = bpy.data.collections.new("Bores")
+            scene_col.children.link(col)
+            col.hide_viewport = True
+            col.hide_render   = True
+        return col
+
     def _build_node(self, node, parent_col, parent_world):
         world = parent_world @ node["mat"]
         name  = node["name"]
+
+        # Bore/hardware objects: move to hidden collection (holes are
+        # already tessellated into panel faces via <ph><h> data).
+        if name in _BORE_PART_TYPES:
+            bore_col = self._get_bore_col(
+                bpy.context.scene.collection)
+            for inst in node["ginst"]:
+                gdata = self.p.geometries.get(inst["gid"])
+                if gdata is None: continue
+                obj = self._make_mesh(gdata, name, inst["mmap"], world)
+                if obj: bore_col.objects.link(obj)
+            for ch in node["children"]:
+                self._build_node(ch, bore_col, world)
+            return
+
         has_ch = bool(node["children"])
         if has_ch:
             sub = bpy.data.collections.new(name)
@@ -522,20 +551,56 @@ class BlenderBuilder:
                 sub_ps = pel.findall(t("p"))
                 ph_els = pel.findall(t("ph"))
                 if ph_els:
-                    # Polygon-with-holes: outer contour is <ph><p>, holes are <ph><h>
-                    # For rendering, use the exterior face from each <ph>; ignore holes
+                    from mathutils.geometry import tessellate_polygon as _tess
                     n_ph_before = len(all_faces)
                     for ph in ph_els:
                         sp = ph.find(t("p"))
                         if sp is None or not (sp.text or "").strip(): continue
                         sr = list(map(int, sp.text.split()))
-                        nv = len(sr) // stride
-                        f,u = self._decode(sr, nv, stride, pos_off, uv_off, uv_src, bverts)
-                        if f:
-                            all_faces.append(f); all_uvs.append(u); all_mat_idx.append(si)
-                    _log("  polygons(<ph>): %d faces" % (len(all_faces)-n_ph_before))
-                    # Also handle any direct <p> children that sit alongside <ph> elements
-                    # (plain faces with no holes, e.g. the bottom face of a panel)
+                        nv_ext = len(sr) // stride
+                        ext_vids, ext_uvs = self._decode(sr, nv_ext, stride, pos_off, uv_off, uv_src, bverts)
+
+                        # Collect hole contours from <ph><h> children
+                        h_data = []
+                        for h_el in ph.findall(t("h")):
+                            if not (h_el.text or "").strip(): continue
+                            hr = list(map(int, h_el.text.split()))
+                            nv_h = len(hr) // stride
+                            h_vids, h_uvs = self._decode(hr, nv_h, stride, pos_off, uv_off, uv_src, bverts)
+                            if h_vids: h_data.append((h_vids, h_uvs))
+
+                        if not h_data:
+                            # No holes — emit simple polygon
+                            if ext_vids:
+                                all_faces.append(ext_vids); all_uvs.append(ext_uvs); all_mat_idx.append(si)
+                        else:
+                            # Build vid→UV lookup for outer ring and all holes
+                            vid_uv = {vid: uv for vid, uv in zip(ext_vids, ext_uvs)}
+                            for h_vids, h_uvs in h_data:
+                                for vid, uv in zip(h_vids, h_uvs):
+                                    if vid not in vid_uv: vid_uv[vid] = uv
+
+                            # Concatenated vid list (outer first, then holes)
+                            # — matches tessellate_polygon's index space
+                            all_ring_vids = list(ext_vids)
+                            for h_vids, _ in h_data: all_ring_vids.extend(h_vids)
+
+                            outer_vecs = [mathutils.Vector(bverts[vid]) for vid in ext_vids]
+                            hole_vecs  = [[mathutils.Vector(bverts[vid]) for vid in h_vids]
+                                          for h_vids, _ in h_data]
+                            try:
+                                tris = _tess([outer_vecs] + hole_vecs)
+                                for tri in tris:
+                                    f = [all_ring_vids[tri[j]] for j in range(3)]
+                                    u = [vid_uv.get(all_ring_vids[tri[j]], (0.0, 0.0)) for j in range(3)]
+                                    all_faces.append(f); all_uvs.append(u); all_mat_idx.append(si)
+                            except Exception as _te:
+                                _log("  tessellate_polygon failed (%s); simple face fallback" % _te)
+                                if ext_vids:
+                                    all_faces.append(ext_vids); all_uvs.append(ext_uvs); all_mat_idx.append(si)
+
+                    _log("  polygons(<ph>): %d faces (holes tessellated)" % (len(all_faces)-n_ph_before))
+                    # Also handle plain <p> children alongside <ph> elements
                     for sp in sub_ps:
                         if not (sp.text or "").strip(): continue
                         sr = list(map(int, sp.text.split()))
@@ -594,6 +659,11 @@ class BlenderBuilder:
                         layer.data[li_idx].uv = fuv[li]
                     else:
                         layer.data[li_idx].uv = (0.0, 0.0)
+            # Bore objects need their UV map rotated 90 degrees
+            if obj_name.upper().endswith("BORE"):
+                for ld in layer.data:
+                    u, v = ld.uv
+                    ld.uv = (1.0 - v, u)  # 90° CCW
 
         for si in sorted(slot_to_mid):
             bl_mat = self.bl_mats.get(slot_to_mid[si])
