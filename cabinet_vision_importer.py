@@ -302,9 +302,10 @@ class DAEParser:
 
 class BlenderBuilder:
     def __init__(self, parser, report_fn=None):
-        self.p      = parser
-        self.report = report_fn or (lambda m: None)
-        self.bl_mats = {}
+        self.p           = parser
+        self.report      = report_fn or (lambda m: None)
+        self.bl_mats     = {}
+        self._join_groups = []  # groups of sub-mesh objects to join per part instance
 
         if parser.up_axis == "Y_UP":
             self._corr = mathutils.Matrix.Rotation(math.radians(90), 4, "X")
@@ -387,6 +388,15 @@ class BlenderBuilder:
             col.hide_render   = True
         return col
 
+    def _get_or_create_col(self, parent_col, name):
+        """Return existing child collection named `name`, or create and link one."""
+        for child in parent_col.children:
+            if child.name == name:
+                return child
+        col = bpy.data.collections.new(name)
+        parent_col.children.link(col)
+        return col
+
     def _build_node(self, node, parent_col, parent_world):
         world = parent_world @ node["mat"]
         name  = node["name"]
@@ -403,6 +413,26 @@ class BlenderBuilder:
                 if obj: bore_col.objects.link(obj)
             for ch in node["children"]:
                 self._build_node(ch, bore_col, world)
+            return
+
+        # If this wrapper node has no direct geometry and all children are
+        # real part nodes (not VN_/PA_ wrappers themselves), collapse the
+        # extra collection level: group each part type into one shared
+        # collection inside parent_col instead of one collection per instance.
+        if (not node["ginst"] and node["children"] and
+                all(not ch["name"].startswith(("VN_", "PA_"))
+                    for ch in node["children"])):
+            per_type = {}
+            for ch in node["children"]:
+                part_col = self._get_or_create_col(parent_col, ch["name"])
+                before   = {o.name for o in part_col.objects}
+                self._build_node(ch, part_col, world)
+                new_objs = [o for o in part_col.objects if o.name not in before]
+                if new_objs:
+                    per_type.setdefault(ch["name"], []).extend(new_objs)
+            for objs in per_type.values():
+                if len(objs) > 1:
+                    self._join_groups.append(objs)
             return
 
         has_ch = bool(node["children"])
@@ -714,6 +744,28 @@ class IMPORT_OT_cabinet_vision_dae(Operator, ImportHelper):
         description="Enable if textures appear upside-down",
         default=False)
 
+    def join_part_groups(self, context):
+        """Join sub-mesh objects that belong to the same physical part instance."""
+        if not self._join_groups:
+            return
+        vl   = context.view_layer
+        prev = vl.objects.active
+        for o in list(context.selected_objects):
+            o.select_set(False)
+        for group in self._join_groups:
+            valid = [o for o in group if o.name in vl.objects]
+            if len(valid) < 2:
+                continue
+            vl.objects.active = valid[0]
+            for o in valid:
+                o.select_set(True)
+            try:
+                bpy.ops.object.join()
+            except Exception as exc:
+                _log("join failed: %s" % exc)
+            valid[0].select_set(False)
+        vl.objects.active = prev
+
     def execute(self, context):
         _log("="*60)
         _log("Importing:", self.filepath)
@@ -723,6 +775,7 @@ class IMPORT_OT_cabinet_vision_dae(Operator, ImportHelper):
             p.parse()
             b = BlenderBuilder(p, report_fn=warnings.append)
             b.build(context)
+            b.join_part_groups(context)
             if self.flip_uv_v:
                 for obj in context.scene.objects:
                     if obj.type=="MESH" and obj.data.uv_layers:
