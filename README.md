@@ -1,5 +1,7 @@
 CV .dae export needs to be in UTF-8 output and not ANSI or unicode
 
+I've only tested in Blender 5.1+ but it should work fine back to 4.0
+
 
 
 
