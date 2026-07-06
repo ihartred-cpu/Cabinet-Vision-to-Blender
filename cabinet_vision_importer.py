@@ -415,9 +415,15 @@ class BlenderBuilder:
                 self._build_node(ch, bore_col, world)
             return
 
-        # If this wrapper node has no direct geometry and all children are
-        # real part nodes (not VN_/PA_ wrappers themselves), collapse the
-        # extra collection level: group each part type into one shared
+        # PA_ assembly wrappers: transparent pass-through — no collection of
+        # their own.  Recurse children straight into parent_col.
+        if name.startswith("PA_") and not node["ginst"]:
+            for ch in node["children"]:
+                self._build_node(ch, parent_col, world)
+            return
+
+        # If this wrapper node has no direct geometry and all children have
+        # clean CV part names, collapse: group each part type into one shared
         # collection inside parent_col instead of one collection per instance.
         if (not node["ginst"] and node["children"] and
                 all(not ch["name"].startswith(("VN_", "PA_"))
