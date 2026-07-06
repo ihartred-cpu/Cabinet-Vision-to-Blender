@@ -53,6 +53,7 @@ class DAEParser:
         self.effects   = {}
         self.materials = {}
         self.geometries= {}
+        self.lights    = {}   # id -> light dict
         self.lib_nodes  = {}   # id -> raw element (from library_nodes)
         self.scene_nodes = []
         tree = ET.parse(filepath)
@@ -78,13 +79,14 @@ class DAEParser:
         self._effects()
         self._materials()
         self._geometries()
+        self._lights()
         self._parse_library_nodes()
         self._scene()
-        _log("up=%s unit=%s images=%d effects=%d mats=%d geoms=%d nodes=%d" % (
+        _log("up=%s unit=%s images=%d effects=%d mats=%d geoms=%d lights=%d nodes=%d" % (
             self.up_axis, self.unit_meter,
             len(self.images), len(self.effects),
             len(self.materials), len(self.geometries),
-            len(self.scene_nodes)))
+            len(self.lights), len(self.scene_nodes)))
 
     def _asset(self):
         a = self._find(self._root, "asset")
@@ -225,6 +227,48 @@ class DAEParser:
             _log("  geom '%s': pos_sid=%r  sources=%s  prims=%s" % (
                 gname, pos_sid, list(sources.keys()), [p for p,_ in prims]))
 
+    def _lights(self):
+        lib = self._find(self._root, "library_lights")
+        for light in self._all(lib, "light"):
+            lid   = light.get("id", "")
+            lname = light.get("name", lid)
+            tc    = self._find(light, "technique_common")
+            if tc is None:
+                continue
+            d = {"name": lname, "type": "POINT", "color": (1.0, 1.0, 1.0), "energy": 10.0}
+            for ltype in ("point", "directional", "spot", "ambient"):
+                el = self._find(tc, ltype)
+                if el is None:
+                    continue
+                d["type"] = {"point": "POINT", "directional": "SUN",
+                             "spot": "SPOT", "ambient": "SUN"}[ltype]
+                c = self._find(el, "color")
+                if c is not None and c.text:
+                    try:
+                        v = list(map(float, c.text.split()))
+                        d["color"] = tuple(v[:3]) if len(v) >= 3 else (1.0, 1.0, 1.0)
+                    except ValueError:
+                        pass
+                if ltype == "spot":
+                    fa = self._find(el, "falloff_angle")
+                    if fa is not None and fa.text:
+                        try:
+                            d["spot_size"] = math.radians(float(fa.text))
+                        except ValueError:
+                            pass
+                if ltype == "point":
+                    qa = self._find(el, "quadratic_attenuation")
+                    if qa is not None and qa.text:
+                        try:
+                            q = float(qa.text)
+                            if q > 1e-8:
+                                d["energy"] = min(1000.0, 1.0 / q)
+                        except ValueError:
+                            pass
+                break
+            self.lights[lid] = d
+            _log("  light '%s': type=%s color=%s" % (lid, d["type"], d["color"]))
+
     def _node_matrix(self, node_el):
         m = mathutils.Matrix.Identity(4)
         for ch in node_el:
@@ -272,6 +316,8 @@ class DAEParser:
                 for im in self._all(tc, "instance_material"):
                     mm[im.get("symbol","")] = _strip(im.get("target",""))
             ginst.append({"gid":gid, "mmap":mm})
+        linst = [_strip(il.get("url", "")) for il in self._all(node_el, "instance_light")
+                 if _strip(il.get("url", ""))]
         children = [self._parse_node(c) for c in self._all(node_el, "node")]
         # Cabinet Vision stores geometry in <library_nodes> and references it
         # from visual scene nodes via <instance_node>.  Resolve those here.
@@ -282,7 +328,7 @@ class DAEParser:
                 children.append(self._parse_node(lib_node_el))
             else:
                 _log("WARNING: instance_node %r not in library_nodes" % ref_id)
-        return {"name":name, "mat":mat, "ginst":ginst, "children":children}
+        return {"name":name, "mat":mat, "ginst":ginst, "linst":linst, "children":children}
 
     def _scene(self):
         sc = self._find(self._root, "scene")
@@ -460,6 +506,52 @@ class BlenderBuilder:
 
         for ch in node["children"]:
             self._build_node(ch, cur, world)
+
+        for lid in node.get("linst", []):
+            ldict = self.p.lights.get(lid)
+            if ldict is None:
+                _log("WARNING: light '%s' not found" % lid)
+                continue
+            obj = self._make_light(ldict, name, world)
+            if obj:
+                cur.objects.link(obj)
+
+    def _make_light(self, ldict, name, world):
+        """Create a Blender light object from a parsed Collada light dict."""
+        ltype  = ldict.get("type", "POINT")
+        color  = ldict.get("color", (1.0, 1.0, 1.0))
+        energy = ldict.get("energy", 10.0)
+        ldata  = bpy.data.lights.new(name=name, type=ltype)
+        ldata.color  = color
+        ldata.energy = energy
+        if ltype == "SPOT" and "spot_size" in ldict:
+            ldata.spot_size = ldict["spot_size"]
+        obj = bpy.data.objects.new(name=name, object_data=ldata)
+        obj.matrix_world = world
+        _log("  light created: '%s' type=%s energy=%.2f" % (name, ltype, energy))
+        return obj
+
+    def join_part_groups(self, context):
+        """Join sub-mesh objects that belong to the same physical part instance."""
+        if not self._join_groups:
+            return
+        vl   = context.view_layer
+        prev = vl.objects.active
+        for o in list(context.selected_objects):
+            o.select_set(False)
+        for group in self._join_groups:
+            valid = [o for o in group if o.name in vl.objects]
+            if len(valid) < 2:
+                continue
+            vl.objects.active = valid[0]
+            for o in valid:
+                o.select_set(True)
+            try:
+                bpy.ops.object.join()
+            except Exception as exc:
+                _log("join failed: %s" % exc)
+            valid[0].select_set(False)
+        vl.objects.active = prev
 
     def _make_mesh(self, gdata, obj_name, mmap, world):
         sources  = gdata["sources"]
@@ -749,28 +841,6 @@ class IMPORT_OT_cabinet_vision_dae(Operator, ImportHelper):
         name="Flip UV (V axis)",
         description="Enable if textures appear upside-down",
         default=False)
-
-    def join_part_groups(self, context):
-        """Join sub-mesh objects that belong to the same physical part instance."""
-        if not self._join_groups:
-            return
-        vl   = context.view_layer
-        prev = vl.objects.active
-        for o in list(context.selected_objects):
-            o.select_set(False)
-        for group in self._join_groups:
-            valid = [o for o in group if o.name in vl.objects]
-            if len(valid) < 2:
-                continue
-            vl.objects.active = valid[0]
-            for o in valid:
-                o.select_set(True)
-            try:
-                bpy.ops.object.join()
-            except Exception as exc:
-                _log("join failed: %s" % exc)
-            valid[0].select_set(False)
-        vl.objects.active = prev
 
     def execute(self, context):
         _log("="*60)
