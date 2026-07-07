@@ -380,6 +380,14 @@ class BlenderBuilder:
         for sub in ("","textures","Textures","images","Images","materials","Maps"):
             c = os.path.join(self.p.directory, sub, base)
             if os.path.exists(c): return c
+        # Fallback: recursive, case-insensitive search under the .dae's
+        # own directory. Handles textures nested more than one level deep,
+        # or filesystems (Mac/Linux) where case doesn't match exactly.
+        base_lower = base.lower()
+        for root, dirs, files in os.walk(self.p.directory):
+            for f in files:
+                if f.lower() == base_lower:
+                    return os.path.join(root, f)
         return None
 
     def _make_mat(self, mid, md):
@@ -420,6 +428,9 @@ class BlenderBuilder:
                     loaded = True
                 except Exception as e:
                     _log("Texture load failed:", ap, e)
+            else:
+                _log("Texture NOT FOUND for material '%s': %r (looked under %s)" % (
+                    mat_name, tp, self.p.directory))
         if not loaded:
             bsdf.inputs["Base Color"].default_value = md.get("color",(0.8,0.8,0.8,1.0))
         return mat
