@@ -1,5 +1,9 @@
 CV .dae export needs to be in UTF-8 output and not ANSI or unicode
 
+I've only tested in Blender 4.5.7 & 5.1+ but it should work fine back to 4.0
+
+Supports all materials, as well a lighting. 
+
 
 
 
