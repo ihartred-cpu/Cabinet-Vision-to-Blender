@@ -5,6 +5,24 @@
 #  Diagnostic output: Window > Toggle System Console (Windows)
 #
 #  CHANGELOG
+#  1.7.0 - Some panels (typically uprights with a dado/groove cut into their
+#          interior face, as opposed to a rabbet cut from an edge) import
+#          with the cut invisible: Cabinet Vision correctly builds the
+#          recessed floor and side walls of the pocket, but exports the
+#          panel's own large flat face WITHOUT a hole for it, so the real
+#          pocket geometry sits, unseen, directly behind a solid unbroken
+#          face. New opt-in "Fix Hidden Dado/Notch Faces" checkbox scans
+#          each joined part for exactly this signature (a large flat face
+#          fully covering a much smaller, near-coincident, parallel face)
+#          and cuts away just the covering portion, exposing the pocket
+#          that was already there. Off by default since it deletes
+#          geometry -- turn it on when a part looks like it's missing a
+#          dado/notch that should be visible. Also: standalone DADO/
+#          NOTCH/BORE reference objects that Cabinet Vision emits as their
+#          own siblings (rather than nested inside the one panel they cut
+#          into, so they can't be joined into it) previously imported as
+#          ordinary visible parts cluttering the scene; they now move into
+#          the same hidden collection as bore hardware.
 #  1.6.0 - Collections now preserve each part's association with its
 #          assembly. Previously, once part names were "clean" (no VN_/PA_
 #          prefix), same-named parts from every assembly in the whole file
@@ -41,7 +59,7 @@
 bl_info = {
     "name": "Cabinet Vision DAE Importer",
     "author": "Custom",
-    "version": (1, 6, 0),
+    "version": (1, 7, 0),
     "blender": (4, 0, 0),
     "location": "File > Import > Cabinet Vision (.dae)",
     "description": "Import Cabinet Vision Collada exports with correct geometry, materials, UVs, hierarchy, and joined physical parts",
@@ -497,11 +515,16 @@ class BlenderBuilder:
             bsdf.inputs["Base Color"].default_value = md.get("color",(0.8,0.8,0.8,1.0))
         return mat
 
-    def _get_bore_col(self, scene_col):
-        """Return (creating if needed) a hidden 'Bores' collection."""
-        col = bpy.data.collections.get("Bores")
+    def _get_hidden_features_col(self, scene_col):
+        """Return (creating if needed) a hidden collection for reference/
+        helper geometry that isn't a real visible part on its own: bore
+        hardware, and standalone dado/notch marker objects that Cabinet
+        Vision didn't nest inside the one panel they cut into (so they
+        never get absorbed into that panel's join -- see
+        _is_physical_part_root)."""
+        col = bpy.data.collections.get("CV Hidden Features")
         if col is None:
-            col = bpy.data.collections.new("Bores")
+            col = bpy.data.collections.new("CV Hidden Features")
             scene_col.children.link(col)
             col.hide_viewport = True
             col.hide_render   = True
@@ -630,7 +653,7 @@ class BlenderBuilder:
         # Bore/hardware objects: move to hidden collection (holes are
         # already tessellated into panel faces via <ph><h> data).
         if name in _BORE_PART_TYPES:
-            bore_col = self._get_bore_col(
+            bore_col = self._get_hidden_features_col(
                 bpy.context.scene.collection)
             for inst in node["ginst"]:
                 gdata = self.p.geometries.get(inst["gid"])
@@ -639,6 +662,27 @@ class BlenderBuilder:
                 if obj: bore_col.objects.link(obj)
             for ch in node["children"]:
                 self._build_node(ch, bore_col, world)
+            return
+
+        # Standalone dado/notch/bore reference objects: Cabinet Vision
+        # normally nests these inside the one panel they cut into, where
+        # _is_physical_part_root/_build_physical_part above absorbs them
+        # into that panel's join. When a feature is instead exported as
+        # its own sibling node (e.g. a groove shared across more than one
+        # part, like a back-panel dado spanning both uprights), it never
+        # gets nested that way and falls through to here as an ordinary
+        # leaf. It's reference/helper geometry, not an independent visible
+        # part, so it goes in the same hidden collection as bore hardware
+        # rather than cluttering the visible scene under its own name.
+        if _is_feature_name(name) and node["ginst"]:
+            hidden_col = self._get_hidden_features_col(bpy.context.scene.collection)
+            for inst in node["ginst"]:
+                gdata = self.p.geometries.get(inst["gid"])
+                if gdata is None: continue
+                obj = self._make_mesh(gdata, name, inst["mmap"], world)
+                if obj: hidden_col.objects.link(obj)
+            for ch in node["children"]:
+                self._build_node(ch, hidden_col, world)
             return
 
         # PA_ assembly wrappers.
@@ -806,6 +850,168 @@ class BlenderBuilder:
         if objs:
             _log("Clean topology: %d -> %d faces across %d joined objects" % (
                 n_faces_before, n_faces_after, len(objs)))
+
+    # ── hidden dado/notch cutting ───────────────────────────────────────
+    #
+    # Some panels (typically uprights, with a dado/groove cut into their
+    # *interior* face rather than a rabbet cut from an edge) import with
+    # the cut invisible. Cabinet Vision correctly builds the recessed
+    # floor and side walls of the pocket -- that geometry genuinely exists
+    # in the file -- but exports the panel's own large flat face without a
+    # hole for it, so the real pocket sits, unseen, directly behind a
+    # solid, unbroken face. The signature is distinctive: a large flat
+    # face and a much smaller, near-coincident, *parallel* face (the
+    # pocket's floor) whose footprint is fully contained inside the big
+    # face's footprint. Where that pattern is found, this cuts away just
+    # the covering portion of the big face so the pocket already modeled
+    # behind it becomes visible -- it does not invent any new geometry.
+
+    def _planar_face_groups(self, bm, normal_round=2, offset_round=4):
+        """Cluster bmesh faces into coplanar, co-facing groups keyed by
+        (rounded unit normal, rounded plane offset)."""
+        groups = {}
+        for f in bm.faces:
+            n = f.normal
+            if n.length < 1e-6:
+                continue
+            n = n.normalized()
+            nkey = (round(n.x, normal_round), round(n.y, normal_round), round(n.z, normal_round))
+            offset = round(n.dot(f.verts[0].co), offset_round)
+            g = groups.setdefault((nkey, offset), {"normal": n, "faces": [], "area": 0.0})
+            g["faces"].append(f)
+            g["area"] += f.calc_area()
+        return groups
+
+    @staticmethod
+    def _perp_basis(normal):
+        """Return two unit vectors spanning the plane perpendicular to `normal`."""
+        n = normal.normalized()
+        ref = mathutils.Vector((1.0, 0.0, 0.0))
+        if abs(n.dot(ref)) > 0.9:
+            ref = mathutils.Vector((0.0, 1.0, 0.0))
+        u = n.cross(ref).normalized()
+        v = n.cross(u).normalized()
+        return u, v
+
+    def _find_hidden_dado(self, bm, max_depth=0.05, max_area_ratio=0.25, containment_margin=0.01):
+        """Find one (bridging face, recessed floor) pair matching the hidden-
+        dado signature described above, or None. `max_depth` bounds how far
+        behind the big face the recessed floor can sit (a dado/notch is
+        shallow relative to the panel it's cut into); `max_area_ratio`
+        bounds how small the floor must be relative to the face covering
+        it; `containment_margin` allows a hair of slack when checking that
+        the floor's footprint sits inside the big face's footprint."""
+        groups = self._planar_face_groups(bm)
+        by_normal = {}
+        for (nkey, offset), g in groups.items():
+            by_normal.setdefault(nkey, []).append((offset, g))
+
+        for entries in by_normal.values():
+            if len(entries) < 2:
+                continue
+            entries.sort(key=lambda e: -e[1]["area"])
+            bridge_offset, bridge = entries[0]
+            if bridge["area"] < 1e-6:
+                continue
+            u_axis, v_axis = self._perp_basis(bridge["normal"])
+            origin = bridge["faces"][0].verts[0].co.copy()
+            b_us = [(v.co - origin).dot(u_axis) for f in bridge["faces"] for v in f.verts]
+            b_vs = [(v.co - origin).dot(v_axis) for f in bridge["faces"] for v in f.verts]
+            b_bounds = (min(b_us), max(b_us), min(b_vs), max(b_vs))
+
+            for floor_offset, floor in entries[1:]:
+                depth = abs(floor_offset - bridge_offset)
+                if depth < 1e-5 or depth > max_depth:
+                    continue
+                if floor["area"] > bridge["area"] * max_area_ratio:
+                    continue
+                f_us = [(v.co - origin).dot(u_axis) for f in floor["faces"] for v in f.verts]
+                f_vs = [(v.co - origin).dot(v_axis) for f in floor["faces"] for v in f.verts]
+                f_bounds = (min(f_us), max(f_us), min(f_vs), max(f_vs))
+                if (f_bounds[0] < b_bounds[0] - containment_margin or
+                        f_bounds[1] > b_bounds[1] + containment_margin or
+                        f_bounds[2] < b_bounds[2] - containment_margin or
+                        f_bounds[3] > b_bounds[3] + containment_margin):
+                    continue  # floor isn't inside the big face's footprint -- not a match
+                return {
+                    "normal": bridge["normal"], "offset": bridge_offset,
+                    "u_axis": u_axis, "v_axis": v_axis, "origin": origin,
+                    "bridge_bounds": b_bounds,
+                    "u_lo": f_bounds[0], "u_hi": f_bounds[1],
+                    "v_lo": f_bounds[2], "v_hi": f_bounds[3],
+                }
+        return None
+
+    def _cut_one_hidden_dado(self, bm, match, edge_margin=1e-4):
+        """Bisect the bridging face group along the recessed floor's
+        footprint boundary (skipping any side that already coincides with
+        the panel's own edge) and delete the portion directly over the
+        floor, exposing it."""
+        normal, offset = match["normal"], match["offset"]
+        u_axis, v_axis, origin = match["u_axis"], match["v_axis"], match["origin"]
+        nkey = (round(normal.x, 2), round(normal.y, 2), round(normal.z, 2))
+
+        def bridge_faces_now():
+            return [f for f in bm.faces
+                    if f.normal.length > 1e-6
+                    and (round(f.normal.normalized().x, 2), round(f.normal.normalized().y, 2),
+                         round(f.normal.normalized().z, 2)) == nkey
+                    and abs(normal.dot(f.verts[0].co) - offset) < 1e-4]
+
+        bb = match["bridge_bounds"]
+        cuts = (
+            (u_axis, match["u_lo"], bb[0]), (u_axis, match["u_hi"], bb[1]),
+            (v_axis, match["v_lo"], bb[2]), (v_axis, match["v_hi"], bb[3]),
+        )
+        for axis, bound, edge in cuts:
+            if abs(bound - edge) < edge_margin:
+                continue  # the notch already reaches the panel's own edge here
+            plane_co = origin + axis * bound
+            geom = list(bm.verts) + list(bm.edges) + bridge_faces_now()
+            bmesh.ops.bisect_plane(bm, geom=geom, dist=1e-6,
+                                    plane_co=plane_co, plane_no=axis,
+                                    clear_inner=False, clear_outer=False)
+            bm.faces.ensure_lookup_table()
+
+        to_delete = []
+        for f in bridge_faces_now():
+            verts = [v.co for v in f.verts]
+            cu = sum((v - origin).dot(u_axis) for v in verts) / len(verts)
+            cv = sum((v - origin).dot(v_axis) for v in verts) / len(verts)
+            if (match["u_lo"] - edge_margin < cu < match["u_hi"] + edge_margin and
+                    match["v_lo"] - edge_margin < cv < match["v_hi"] + edge_margin):
+                to_delete.append(f)
+        n = len(to_delete)
+        bmesh.ops.delete(bm, geom=to_delete, context="FACES")
+        return n
+
+    def fix_hidden_dado_faces(self, max_per_object=8):
+        """Run on each just-joined physical part: repeatedly find and open
+        up hidden dado/notch pockets (see _find_hidden_dado) until none are
+        left or `max_per_object` cuts have been made, whichever comes
+        first -- a panel can have more than one such pocket."""
+        objs = getattr(self, "_joined_objects", [])
+        total_cuts = total_objs = 0
+        for obj in objs:
+            if obj.type != "MESH":
+                continue
+            bm = bmesh.new()
+            bm.from_mesh(obj.data)
+            cuts_here = 0
+            for _ in range(max_per_object):
+                match = self._find_hidden_dado(bm)
+                if not match:
+                    break
+                cuts_here += self._cut_one_hidden_dado(bm, match)
+            if cuts_here:
+                bm.to_mesh(obj.data)
+                obj.data.update()
+                total_cuts += cuts_here
+                total_objs += 1
+            bm.free()
+        if total_cuts:
+            _log("Fix hidden dado/notch faces: opened %d face(s) across %d object(s)" % (
+                total_cuts, total_objs))
 
     def _merge_by_distance(self, objs):
         """Weld vertices within self._merge_distance of each other on each
@@ -1144,6 +1350,18 @@ class IMPORT_OT_cabinet_vision_dae(Operator, ImportHelper):
                       "moves a vertex), which matters if anything "
                       "downstream depends on CV's exact triangulation"),
         default=False)
+    fix_hidden_dados: BoolProperty(
+        name="Fix Hidden Dado/Notch Faces",
+        description=("Cabinet Vision sometimes exports a panel's dado/"
+                      "notch pocket correctly, but leaves the panel's own "
+                      "flat face uncut over it, hiding the pocket behind "
+                      "solid material. Find that pattern (a big flat face "
+                      "fully covering a much smaller, near-coincident, "
+                      "parallel face) and cut the covering portion away. "
+                      "Off by default since it deletes geometry -- turn "
+                      "on if a part looks like it's missing a dado/notch "
+                      "cut that should be visible"),
+        default=False)
 
     def execute(self, context):
         _log("="*60)
@@ -1159,6 +1377,8 @@ class IMPORT_OT_cabinet_vision_dae(Operator, ImportHelper):
             b.join_part_groups(context)
             if self.clean_topology:
                 b.clean_topology()
+            if self.fix_hidden_dados:
+                b.fix_hidden_dado_faces()
             if self.flip_uv_v:
                 for obj in context.scene.objects:
                     if obj.type=="MESH" and obj.data.uv_layers:
@@ -1184,6 +1404,7 @@ class IMPORT_OT_cabinet_vision_dae(Operator, ImportHelper):
         dist_row.enabled = self.merge_by_distance
         dist_row.prop(self, "merge_distance")
         layout.prop(self, "clean_topology")
+        layout.prop(self, "fix_hidden_dados")
         layout.prop(self, "flip_uv_v")
 
 # ──────────────────────────────────────────────────────────────

@@ -1,11 +1,15 @@
-CV .dae export needs to be in UTF-8 output and not ANSI or unicode
+# Cabinet Vision to Blender
 
-I've only tested in Blender 4.5.7 & 5.1+ but it should work fine back to 4.0
+A Blender add-on that imports Cabinet Vision's Collada (`.dae`) exports directly into a clean, organized Blender scene — correct geometry, materials, UVs, and lighting, with cabinets rebuilt as sensible, editable objects instead of a pile of disconnected meshes.
 
-Supports all materials, as well a lighting. 
+Most Collada importers (including Blender's built-in one) just dump the raw scene graph: every face, edgeband strip, and boring/dado/notch fragment comes in as its own separate object, with no regard for which panel or cabinet it belongs to. This add-on is built specifically around how Cabinet Vision structures its Collada exports, so it can reconstruct what CV actually meant:
 
+- **Joined parts** — each physical panel's faces, edgebanding, and boring/dado are recognized as one unit and joined into a single, selectable object, with duplicate seam vertices automatically welded.
+- **Assembly-aware collections** — parts stay grouped under their own cabinet/countertop/molding run, in a collection named from Cabinet Vision's own label (e.g. "Base Cabinet Assembly"), instead of every same-named part across the whole file getting pooled together.
+- **Hidden-feature repair** — an opt-in "Fix Hidden Dado/Notch Faces" pass catches panels where CV builds a correct recessed pocket but exports an unbroken face covering it, and cuts away just the covering portion so the pocket is actually visible. Standalone dado/notch/bore reference objects that CV emits as loose siblings (rather than nested where they'd get joined) are swept into a hidden collection instead of cluttering the scene.
+- **Optional clean topology pass** — an off-by-default Limited Dissolve + Tris to Quads step to tidy up flat, over-triangulated faces without moving any vertices.
 
-
+Tested in Blender 4.5.7 and 5.1+, and should work back to 4.0. Note: the CV `.dae` export must be saved as UTF-8, not ANSI/Unicode.
 
 ![Cabinet Vision](https://github.com/ihartred-cpu/Cabinet-Vision-to-Blender/blob/main/Screenshot%202026-06-30%20123044.png)
 
@@ -18,6 +22,10 @@ Supports all materials, as well a lighting.
 ![Blender](https://github.com/ihartred-cpu/Cabinet-Vision-to-Blender/blob/main/Screenshot%202026-07-06%20095110.png)
 
 ## Changelog
+
+### 1.7.0
+- Some panels (typically uprights with a dado/groove cut into their interior face, as opposed to a rabbet cut from an edge) import with the cut invisible: Cabinet Vision correctly builds the recessed floor and side walls of the pocket, but exports the panel's own large flat face without a hole for it, so the real pocket geometry sits, unseen, directly behind a solid unbroken face. New opt-in "Fix Hidden Dado/Notch Faces" checkbox scans each joined part for exactly this signature (a large flat face fully covering a much smaller, near-coincident, parallel face) and cuts away just the covering portion, exposing the pocket that was already there. Off by default since it deletes geometry -- turn it on when a part looks like it's missing a dado/notch that should be visible.
+- Standalone DADO/NOTCH/BORE reference objects that Cabinet Vision emits as their own siblings (rather than nested inside the one panel they cut into, so they can't be joined into it) previously imported as ordinary visible parts cluttering the scene; they now move into the same hidden collection as bore hardware.
 
 ### 1.6.0
 - Collections now preserve each part's association with its assembly. Previously, once part names were "clean" (no `VN_`/`PA_` prefix), same-named parts from every assembly in the whole file (every "RU", every "LU", ...) were pooled into one shared collection, losing which cabinet/countertop/molding run each part belonged to. Each physical assembly (identified as the shallowest point where distinct parts appear as direct children) now gets its own collection — named from Cabinet Vision's own label where available (e.g. "Base Cabinet Assembly") — with its part collections nested inside it.
