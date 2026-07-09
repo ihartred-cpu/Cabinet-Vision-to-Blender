@@ -5,6 +5,33 @@
 #  Diagnostic output: Window > Toggle System Console (Windows)
 #
 #  CHANGELOG
+#  1.11.0 - 1.10.0's bore-absorption only covered bores exported as flat
+#           siblings under a bare (non-PA_) grouping node. In practice
+#           Cabinet Vision often wraps a bore in its own PA_+VN_ pair --
+#           e.g. hinge bores ("_HGAVBORE"/"_HGCVBORE") showing up under
+#           their own "Molding_Door_NN" wrapper, sibling to the door's
+#           real "Door_NN" slab wrapper and to separate hinge-hardware
+#           ("Widget_Arm"/"Widget_Base_Plate") wrappers, all as direct
+#           children of one door assembly -- which the 1.10.0 fix didn't
+#           reach at all. Extended the same "exactly one structural
+#           target absorbs every bore-only sibling" logic to this PA_
+#           assembly level too, additionally excluding any "Widget"-
+#           labeled sibling (hinge arm/base hardware) from ever being a
+#           valid absorption target. Verified directly against the
+#           user's own "salvia out.dae" door structure.
+#  1.10.0 - Bore operations (e.g. "_HGAVBORE" hinge-cup/screw bores) that
+#           Cabinet Vision exports as flat siblings of the part they're
+#           drilled into -- rather than nested inside it the way panel
+#           cuts normally are -- previously stayed unmerged, floating as
+#           their own separate objects instead of becoming part of the
+#           door/drawer-front they belong to. Common on hardware-widget
+#           groupings (hinge plates, etc.) where the door slab and its
+#           bores sit as siblings alongside separate hinge hardware
+#           (arm/base) sub-assemblies. When exactly one non-feature leaf
+#           part exists among such a group of siblings, every bore-type
+#           object in that group is now joined into it; hinge hardware
+#           and any ambiguous (multiple-candidate) groupings are left
+#           untouched to avoid an incorrect merge.
 #  1.9.1 - "Hide Dado/Notch Feature Geometry" (1.9.0) was also catching
 #          BORE-named nodes, hiding boring/drilling geometry along with
 #          the dado/notch pockets. Split the keyword set so hiding only
@@ -65,7 +92,7 @@
 bl_info = {
     "name": "Cabinet Vision DAE Importer",
     "author": "Custom",
-    "version": (1, 9, 1),
+    "version": (1, 11, 0),
     "blender": (4, 0, 0),
     "location": "File > Import > Cabinet Vision (.dae)",
     "description": "Import Cabinet Vision Collada exports with correct geometry, materials, UVs, hierarchy, and joined physical parts",
@@ -1185,8 +1212,60 @@ class BlenderBuilder:
             if self._join_parts and node["children"]:
                 asm_col = bpy.data.collections.new(self._pick_assembly_name(node))
                 parent_col.children.link(asm_col)
+
+                # Cabinet Vision sometimes exports a bore as its own
+                # PA_+VN_-wrapped sibling of the part it's actually
+                # drilled into, rather than nesting it inside that part
+                # the way panel cuts normally are -- e.g. hinge bores
+                # ("_HGAVBORE"/"_HGCVBORE") showing up under their own
+                # "Molding_Door_NN" wrapper alongside the door's real
+                # "Door_NN" slab wrapper, both direct children of the
+                # same door assembly. Classify each direct child up
+                # front (before building) by its own leaf geometry: a
+                # child whose ENTIRE subtree is bore-only is a donor to
+                # be absorbed elsewhere, not a part in its own right.
+                # Anything labeled "Widget" (hinge arm/base and similar
+                # hardware) is never a valid absorption target even
+                # though it isn't feature-named. If exactly one
+                # structural, non-widget child remains as a candidate,
+                # every bore-only child's object(s) get joined into it.
+                target_candidates = []
+                bore_only_children = []
                 for ch in node["children"]:
+                    leaves = []
+                    self._gather_leaf_names(ch, leaves)
+                    non_feature = [n for n in leaves if not _is_feature_name(n)]
+                    bore_leaves = [n for n in leaves
+                                  if _is_feature_name(n) and not _is_hidden_feature_name(n)]
+                    if leaves and not non_feature and bore_leaves:
+                        bore_only_children.append(ch)
+                        continue
+                    vn = self._first_vn_name(ch)
+                    if not (vn and "widget" in vn.lower()):
+                        target_candidates.append(ch)
+
+                # Track objects via self._created_objects (populated by
+                # _build_mesh_object regardless of collection nesting
+                # depth), not asm_col.objects -- a child that isn't
+                # itself "one physical part" recurses into its own
+                # nested sub-collection (e.g. "Assembly (PA_hinge_h1)"),
+                # so its objects never land directly in asm_col and a
+                # diff against asm_col.objects would miss them entirely.
+                per_child_objs = {}
+                for ch in node["children"]:
+                    before = len(self._created_objects)
                     self._build_node(ch, asm_col, world)
+                    new_objs = self._created_objects[before:]
+                    if new_objs:
+                        per_child_objs[id(ch)] = new_objs
+
+                if (self._hide_feature_parts and bore_only_children
+                        and len(target_candidates) == 1):
+                    target_objs = per_child_objs.get(id(target_candidates[0]), [])
+                    bore_objs = [o for ch in bore_only_children
+                                for o in per_child_objs.get(id(ch), [])]
+                    if len(target_objs) == 1 and bore_objs:
+                        self._join_groups.append([target_objs[0]] + bore_objs)
                 return
             for ch in node["children"]:
                 self._build_node(ch, parent_col, world)
@@ -1212,7 +1291,35 @@ class BlenderBuilder:
                 new_objs = [o for o in part_col.objects if o.name not in before]
                 if new_objs:
                     per_type.setdefault(ch["name"], []).extend(new_objs)
-            for objs in per_type.values():
+
+            # BORE operations (e.g. "_HGAVBORE" hinge-cup/screw bores) that
+            # land here as flat siblings -- not nested inside a PA_-wrapped
+            # panel the way "Fix Hidden Dado"-style features normally are
+            # -- belong to whichever structural part they're drilled into
+            # (typically a door/drawer-front slab like "S_DSLAB"), not to
+            # any hardware siblings also grouped here (e.g. "_HGARM"/
+            # "_HGBASE" hinge arm/base, which are physical hinge parts, not
+            # cuts). If exactly one non-feature, childless (leaf-type)
+            # sibling exists at this level with exactly one object, absorb
+            # every bore-type object here into it via an operator join --
+            # DADO/NOTCH never reach this dict at all when hidden (they're
+            # diverted to "CV Hidden Features" inside the _build_node call
+            # above before part_col is ever populated).
+            wrapper_type_names = {ch["name"] for ch in node["children"] if ch["children"]}
+            bore_types = [t for t in per_type
+                          if _is_feature_name(t) and not _is_hidden_feature_name(t)]
+            target_types = [t for t in per_type
+                            if t not in bore_types and t not in wrapper_type_names]
+            absorbed = set()
+            if bore_types and len(target_types) == 1 and len(per_type[target_types[0]]) == 1:
+                target_obj = per_type[target_types[0]][0]
+                bore_objs = [o for t in bore_types for o in per_type[t]]
+                self._join_groups.append([target_obj] + bore_objs)
+                absorbed = set(bore_types) | {target_types[0]}
+
+            for tname, objs in per_type.items():
+                if tname in absorbed:
+                    continue
                 if len(objs) > 1:
                     self._join_groups.append(objs)
             return
