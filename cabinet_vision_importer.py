@@ -5,6 +5,25 @@
 #  Diagnostic output: Window > Toggle System Console (Windows)
 #
 #  CHANGELOG
+#  1.9.1 - "Hide Dado/Notch Feature Geometry" (1.9.0) was also catching
+#          BORE-named nodes, hiding boring/drilling geometry along with
+#          the dado/notch pockets. Split the keyword set so hiding only
+#          ever applies to DADO/NOTCH; BORE geometry always stays merged
+#          and visible, in the panel mesh, same as before 1.9.0.
+#  1.9.0 - Fixed a real bug (present since 1.4.0's part-joining, not
+#          something 1.8.0's rewrite introduced): BORE/DADO/NOTCH feature
+#          geometry nested inside the panel it cuts into (the normal,
+#          documented case -- e.g. "UBDADO", "_HGAVBORE") was being
+#          silently fused into that panel's merged mesh instead of ever
+#          reaching the "hide standalone feature objects" logic added in
+#          1.7.0, which only ever fired for the rarer case of a feature
+#          exported as an un-nestable orphan sibling. New "Hide Bore/
+#          Dado/Notch Feature Geometry" checkbox (on by default) now
+#          catches the nested case too, routing that geometry straight
+#          to the hidden "CV Hidden Features" collection instead of
+#          merging it in. Turn off if a panel's dado/notch pocket only
+#          exists as geometry under one of these feature nodes and you
+#          rely on "Fix Hidden Dado Faces" to expose it.
 #  1.8.0 - Performance / organization rewrite. Import is much faster on
 #          large files:
 #          * Each geometry is decoded from XML exactly ONCE and cached,
@@ -46,7 +65,7 @@
 bl_info = {
     "name": "Cabinet Vision DAE Importer",
     "author": "Custom",
-    "version": (1, 8, 0),
+    "version": (1, 9, 1),
     "blender": (4, 0, 0),
     "location": "File > Import > Cabinet Vision (.dae)",
     "description": "Import Cabinet Vision Collada exports with correct geometry, materials, UVs, hierarchy, and joined physical parts",
@@ -96,13 +115,29 @@ _BORE_PART_TYPES = frozenset()
 # physical part in its own right. Cabinet Vision wraps every one of these
 # features in its own nested "PA_" node, even a single boring, so they
 # can't be told apart from a genuinely separate part by nesting depth
-# alone -- only by name.
+# alone -- only by name. Used to decide physical-part membership/naming
+# (see _is_physical_part_root / _pick_primary_name) -- BORE stays in this
+# set so boring operations are still recognized as belonging to the panel
+# they're cut into rather than being treated as their own separate part.
 _FEATURE_KEYWORDS = ("BORE", "DADO", "NOTCH")
+
+# Subset of _FEATURE_KEYWORDS that gets routed to the hidden "CV Hidden
+# Features" collection (see _gather_instances / _build_node) rather than
+# staying merged and visible in the panel's mesh. BORE is deliberately
+# excluded: boring/drilling operations should stay visible, unlike DADO/
+# NOTCH pockets which are typically redundant duplicate geometry (e.g.
+# "UBDADO").
+_HIDDEN_FEATURE_KEYWORDS = ("DADO", "NOTCH")
 
 
 def _is_feature_name(name):
     n = name.upper()
     return any(k in n for k in _FEATURE_KEYWORDS)
+
+
+def _is_hidden_feature_name(name):
+    n = name.upper()
+    return any(k in n for k in _HIDDEN_FEATURE_KEYWORDS)
 
 
 # Cabinet Vision's VN_ wrapper ids encode a human-readable assembly label
@@ -448,7 +483,8 @@ class DAEParser:
 # ──────────────────────────────────────────────────────────────
 
 class BlenderBuilder:
-    def __init__(self, parser, report_fn=None, join_parts=True, merge_distance=0.0001):
+    def __init__(self, parser, report_fn=None, join_parts=True, merge_distance=0.0001,
+                 hide_feature_parts=True):
         self.p = parser
         self.report = report_fn or (lambda m: None)
         self.bl_mats = {}
@@ -470,6 +506,13 @@ class BlenderBuilder:
         # independently-tessellated faces/edgebanding/boring are welded
         # together. 0 (or None) disables the weld pass.
         self._merge_distance = merge_distance
+        # When True (default), BORE/DADO/NOTCH feature geometry (e.g.
+        # "UBDADO", "_HGAVBORE") is always routed to the hidden "CV Hidden
+        # Features" collection instead of being fused into its parent
+        # panel's merged mesh -- see _gather_instances. Off restores the
+        # legacy behavior of merging nested feature geometry into the
+        # panel it cuts into.
+        self._hide_feature_parts = hide_feature_parts
 
         if parser.up_axis == "Y_UP":
             self._corr = mathutils.Matrix.Rotation(math.radians(90), 4, "X")
@@ -1017,7 +1060,37 @@ class BlenderBuilder:
     def _gather_instances(self, node, world, meshes, lights):
         """Recursively collect every geometry/light instance under `node`
         (regardless of further PA_/VN_ nesting) with resolved world
-        matrices, so a whole physical part can be built as one mesh."""
+        matrices, so a whole physical part can be built as one mesh.
+
+        DADO/NOTCH feature leaves (not BORE -- boring/drilling operations
+        stay visible, see _HIDDEN_FEATURE_KEYWORDS) are diverted straight
+        to the hidden "CV Hidden Features" collection instead of being
+        folded into the merge (when self._hide_feature_parts is on, the
+        default). Cabinet Vision nests these inside the very panel they
+        cut into -- normally via their own nested PA_ wrapper, sitting
+        alongside the panel's bare structural geometry as a direct
+        sibling -- which previously meant _build_physical_part's
+        all-or-nothing gather here fused their geometry straight into
+        the panel mesh with no way to hide it afterward: the "move
+        standalone features to the hidden collection" branch in
+        _build_node only ever fired for features CV exports as
+        un-nestable orphan siblings, never for the far more common
+        nested case. Turn this off if a part's dado/notch pocket only
+        exists as separate geometry under one of these feature nodes
+        and you rely on "Fix Hidden Dado Faces" to expose it -- with
+        this on, that geometry is hidden away rather than merged in, so
+        there's nothing left in the merged mesh for that fix to find."""
+        if (self._hide_feature_parts and _is_hidden_feature_name(node["name"])
+                and node["ginst"]):
+            hidden_col = self._get_hidden_features_col(bpy.context.scene.collection)
+            for inst in node["ginst"]:
+                dec = self._decode_geometry(inst["gid"])
+                obj, _ = self._build_mesh_object(node["name"], [(dec, world, inst["mmap"])])
+                if obj:
+                    hidden_col.objects.link(obj)
+            for ch in node["children"]:
+                self._gather_instances(ch, world @ ch["mat"], meshes, lights)
+            return
         for inst in node["ginst"]:
             meshes.append((self._decode_geometry(inst["gid"]), world, inst["mmap"]))
         for lid in node.get("linst", []):
@@ -1064,17 +1137,19 @@ class BlenderBuilder:
                 self._build_node(ch, bore_col, world)
             return
 
-        # Standalone dado/notch/bore reference objects: Cabinet Vision
-        # normally nests these inside the one panel they cut into, where
-        # _is_physical_part_root/_build_physical_part above absorbs them
-        # into that panel's merge. When a feature is instead exported as
-        # its own sibling node (e.g. a groove shared across more than one
-        # part, like a back-panel dado spanning both uprights), it never
-        # gets nested that way and falls through to here as an ordinary
-        # leaf. It's reference/helper geometry, not an independent visible
-        # part, so it goes in the same hidden collection as bore hardware
-        # rather than cluttering the visible scene under its own name.
-        if _is_feature_name(name) and node["ginst"]:
+        # Standalone dado/notch reference objects (not BORE -- boring/
+        # drilling operations stay visible, see _HIDDEN_FEATURE_KEYWORDS):
+        # Cabinet Vision normally nests these inside the one panel they
+        # cut into, where _is_physical_part_root/_build_physical_part
+        # above absorbs them into that panel's merge. When a feature is
+        # instead exported as its own sibling node (e.g. a groove shared
+        # across more than one part, like a back-panel dado spanning both
+        # uprights), it never gets nested that way and falls through to
+        # here as an ordinary leaf. It's reference/helper geometry, not
+        # an independent visible part, so it goes in the hidden
+        # collection rather than cluttering the visible scene under its
+        # own name.
+        if _is_hidden_feature_name(name) and node["ginst"]:
             hidden_col = self._get_hidden_features_col(bpy.context.scene.collection)
             for inst in node["ginst"]:
                 dec = self._decode_geometry(inst["gid"])
@@ -1489,6 +1564,22 @@ class IMPORT_OT_cabinet_vision_dae(Operator, ImportHelper):
                      "on if a part looks like it's missing a dado/notch "
                      "cut that should be visible"),
         default=False)
+    hide_feature_parts: BoolProperty(
+        name="Hide Dado/Notch Feature Geometry",
+        description=("Cabinet Vision nests DADO/NOTCH feature geometry "
+                     "(e.g. 'UBDADO') inside the panel it cuts into. On, "
+                     "that geometry is always routed to the hidden 'CV "
+                     "Hidden Features' collection instead of being fused "
+                     "into the panel's merged mesh, since it's typically "
+                     "redundant duplicate geometry. BORE (boring/"
+                     "drilling) geometry is never affected by this and "
+                     "always stays merged and visible. Turn off if a "
+                     "panel's dado/notch pocket only exists as separate "
+                     "geometry under one of these feature nodes and you "
+                     "rely on 'Fix Hidden Dado Faces' to expose it -- with "
+                     "this on, there's nothing left in the merged mesh "
+                     "for that fix to find"),
+        default=True)
 
     def execute(self, context):
         import time
@@ -1501,7 +1592,8 @@ class IMPORT_OT_cabinet_vision_dae(Operator, ImportHelper):
             p.parse()
             dist = self.merge_distance if self.merge_by_distance else 0.0
             b = BlenderBuilder(p, report_fn=warnings.append,
-                               join_parts=self.join_parts, merge_distance=dist)
+                               join_parts=self.join_parts, merge_distance=dist,
+                               hide_feature_parts=self.hide_feature_parts)
             b.build(context)
             b.join_part_groups(context)
             b.weld_seams()
@@ -1534,6 +1626,7 @@ class IMPORT_OT_cabinet_vision_dae(Operator, ImportHelper):
         dist_row.prop(self, "merge_distance")
         layout.prop(self, "clean_topology")
         layout.prop(self, "fix_hidden_dados")
+        layout.prop(self, "hide_feature_parts")
         layout.prop(self, "flip_uv_v")
 
 
