@@ -12,6 +12,7 @@ Most Collada importers (including Blender's built-in one) just dump the raw scen
 - **Optional clean topology pass** — an off-by-default Limited Dissolve + Tris to Quads step to tidy up flat, over-triangulated faces without moving any vertices.
 
 Tested in Blender 4.5.7 and 5.1+, and should work back to 4.0. Note: the CV `.dae` export must be saved as UTF-8, not ANSI/Unicode.
+Note: the screenshots in blender are shown with CV lights turned off and an added hdri, as the imported lights are BLOWN out.
 
 ![Cabinet Vision](https://github.com/ihartred-cpu/Cabinet-Vision-to-Blender/blob/main/Screenshot%202026-06-30%20123044.png)
 
