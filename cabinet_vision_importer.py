@@ -3,20 +3,53 @@
 #  File > Import > Cabinet Vision (.dae)
 #
 #  Diagnostic output: Window > Toggle System Console (Windows)
+#
+#  CHANGELOG
+#  1.6.0 - Collections now preserve each part's association with its
+#          assembly. Previously, once part names were "clean" (no VN_/PA_
+#          prefix), same-named parts from every assembly in the whole file
+#          (every "RU", every "LU", ...) were pooled into one shared
+#          collection, losing which cabinet/countertop/molding run each
+#          part belonged to. Each physical assembly (identified as the
+#          shallowest point where distinct parts appear as direct
+#          children) now gets its own collection -- named from Cabinet
+#          Vision's own label where available (e.g. "Base Cabinet
+#          Assembly") -- with its RU/LU/TO/... part collections nested
+#          inside it. Also fixed the "Merge Vertices by Distance" toggle
+#          not being visible/reachable in the import options panel: it
+#          shared a row with the distance field, which could get squeezed
+#          out of a narrow panel; each option now gets its own full-width
+#          row.
+#  1.5.0 - Added optional "Clean Topology" post-process (Limited Dissolve
+#          + Tris to Quads) on joined objects, off by default. Removes
+#          redundant edges on flat, near-coplanar triangulated faces
+#          without moving vertex positions. Left off by default because
+#          it changes face/edge topology near bore holes, which matters
+#          if anything downstream depends on the exact triangulation CV
+#          exported.
+#  1.4.1 - Added automatic "Merge Vertices by Distance" after joining, to
+#          weld the duplicate seam vertices that joining leaves behind
+#          (each face/edgeband/bore was built from its own separate
+#          vertex list, so coincident points aren't shared until merged).
+#  1.4.0 - Physical parts (faces + edgebanding + boring/dado) are now
+#          recognized as a single unit and joined into one selectable
+#          object per panel instance, instead of staying as many
+#          separate un-joined objects.
+#  1.3.0 - (prior baseline)
 # ============================================================
 
 bl_info = {
     "name": "Cabinet Vision DAE Importer",
     "author": "Custom",
-    "version": (1, 3, 0),
+    "version": (1, 6, 0),
     "blender": (4, 0, 0),
     "location": "File > Import > Cabinet Vision (.dae)",
-    "description": "Import Cabinet Vision Collada exports with correct geometry, materials, UVs and hierarchy",
+    "description": "Import Cabinet Vision Collada exports with correct geometry, materials, UVs, hierarchy, and joined physical parts",
     "category": "Import-Export",
 }
 
-import bpy, os, math, mathutils, xml.etree.ElementTree as ET
-from bpy.props import StringProperty, BoolProperty
+import bpy, bmesh, os, math, re, mathutils, xml.etree.ElementTree as ET
+from bpy.props import StringProperty, BoolProperty, FloatProperty
 from bpy_extras.io_utils import ImportHelper
 from bpy.types import Operator
 
@@ -38,6 +71,25 @@ def _cv_part_name(raw):
 # CV bore/hardware objects whose holes are tessellated into the panel faces.
 # These separate floating cylinders are moved to a hidden "Bores" collection.
 _BORE_PART_TYPES = frozenset()  # All bore objects import as normal visible objects
+
+# Sub-part name fragments that mark a leaf as a *feature* cut into a panel
+# (a drilled hole, a dado groove, a notch) rather than an independent
+# physical part in its own right. Cabinet Vision wraps every one of these
+# features in its own nested "PA_" node, even a single boring, so they
+# can't be told apart from a genuinely separate part by nesting depth
+# alone — only by name.
+_FEATURE_KEYWORDS = ("BORE", "DADO", "NOTCH")
+
+def _is_feature_name(name):
+    n = name.upper()
+    return any(k in n for k in _FEATURE_KEYWORDS)
+
+# Cabinet Vision's VN_ wrapper ids encode a human-readable assembly label
+# ("Base_Cabinet_Assembly", "Molding_Molding_Assembly", ...) sandwiched
+# between the hash and a trailing "<instance number>[_<letter>]", e.g.
+# "VN_Sh41fd5fc0_Base_Cabinet_Assembly_44_a". Used to name each assembly's
+# collection so it reads like "Base Cabinet Assembly" instead of a hash.
+_ASSEMBLY_LABEL_RE = re.compile(r"^VN_Sh[0-9a-fA-F]+_(.+?)_\d+(?:_[a-zA-Z])?$")
 
 # ──────────────────────────────────────────────────────────────
 #  Parser
@@ -347,11 +399,21 @@ class DAEParser:
 # ──────────────────────────────────────────────────────────────
 
 class BlenderBuilder:
-    def __init__(self, parser, report_fn=None):
+    def __init__(self, parser, report_fn=None, join_parts=True, merge_distance=0.0001):
         self.p           = parser
         self.report      = report_fn or (lambda m: None)
         self.bl_mats     = {}
         self._join_groups = []  # groups of sub-mesh objects to join per part instance
+        self._joined_objects = []  # populated by join_part_groups() once joins run
+        # When True, each physical part's faces, edgebanding, dados and
+        # boring are merged into a single joined object (see
+        # _is_physical_part_root / _build_physical_part below).
+        self._join_parts = join_parts
+        # Distance (in Blender units, i.e. meters after CV's unit scale is
+        # applied) within which coincident vertices left over from joining
+        # independently-tessellated faces/edgebanding/boring are welded
+        # together. 0 (or None) disables the merge pass.
+        self._merge_distance = merge_distance
 
         if parser.up_axis == "Y_UP":
             self._corr = mathutils.Matrix.Rotation(math.radians(90), 4, "X")
@@ -380,6 +442,14 @@ class BlenderBuilder:
         for sub in ("","textures","Textures","images","Images","materials","Maps"):
             c = os.path.join(self.p.directory, sub, base)
             if os.path.exists(c): return c
+        # Fallback: recursive, case-insensitive search under the .dae's
+        # own directory. Handles textures nested more than one level deep,
+        # or filesystems (Mac/Linux) where case doesn't match exactly.
+        base_lower = base.lower()
+        for root, dirs, files in os.walk(self.p.directory):
+            for f in files:
+                if f.lower() == base_lower:
+                    return os.path.join(root, f)
         return None
 
     def _make_mat(self, mid, md):
@@ -420,6 +490,9 @@ class BlenderBuilder:
                     loaded = True
                 except Exception as e:
                     _log("Texture load failed:", ap, e)
+            else:
+                _log("Texture NOT FOUND for material '%s': %r (looked under %s)" % (
+                    mat_name, tp, self.p.directory))
         if not loaded:
             bsdf.inputs["Base Color"].default_value = md.get("color",(0.8,0.8,0.8,1.0))
         return mat
@@ -443,6 +516,113 @@ class BlenderBuilder:
         parent_col.children.link(col)
         return col
 
+    # ── physical-part flattening (join faces + edgebanding + boring) ───
+
+    def _gather_leaf_names(self, node, out):
+        """Depth-first collect the resolved CV name of every geometry-bearing
+        leaf under `node` (including itself)."""
+        if node["ginst"]:
+            out.append(node["name"])
+        for ch in node["children"]:
+            self._gather_leaf_names(ch, out)
+
+    def _is_physical_part_root(self, node):
+        """True when `node` (a PA_ wrapper) represents exactly one physical
+        part: it has at least one direct, non-PA_ child carrying real panel
+        geometry (a face or edgeband), and every nested PA_ child beneath it
+        contributes only boring/dado/notch features of that same panel —
+        never an unrelated separate part. Cabinet Vision wraps individual
+        bores/dados in their own PA_ node too, so nesting depth alone can't
+        distinguish "one panel with holes" from "an assembly of parts";
+        this checks the actual leaf names instead."""
+        direct_structural = any(
+            not ch["name"].startswith("PA_") and not _is_feature_name(ch["name"])
+            for ch in node["children"]
+        )
+        if not direct_structural:
+            return False
+        for ch in node["children"]:
+            if ch["name"].startswith("PA_"):
+                names = []
+                self._gather_leaf_names(ch, names)
+                if any(not _is_feature_name(n) for n in names):
+                    return False
+        return True
+
+    def _pick_primary_name(self, node):
+        """Name a merged physical part after its most common non-feature
+        leaf (e.g. 'RU'), falling back to the most common leaf overall if
+        every leaf happens to be a feature."""
+        names = []
+        self._gather_leaf_names(node, names)
+        pool = [n for n in names if not _is_feature_name(n)] or names
+        if not pool:
+            return node["name"]
+        counts = {}
+        for n in pool:
+            counts[n] = counts.get(n, 0) + 1
+        return max(counts.items(), key=lambda kv: kv[1])[0]
+
+    # ── assembly grouping (keep each part associated with its assembly) ──
+
+    def _first_vn_name(self, node):
+        """Depth-first search for the first VN_-wrapper id under `node`,
+        used to recover a human-readable assembly label (see
+        _ASSEMBLY_LABEL_RE)."""
+        if node["name"].startswith("VN_"):
+            return node["name"]
+        for ch in node["children"]:
+            found = self._first_vn_name(ch)
+            if found:
+                return found
+        return None
+
+    def _pick_assembly_name(self, node):
+        vn = self._first_vn_name(node)
+        if vn:
+            m = _ASSEMBLY_LABEL_RE.match(vn)
+            if m:
+                label = m.group(1).replace("_", " ").strip()
+                if label:
+                    return label
+        return "Assembly (%s)" % node["name"]
+
+    def _build_physical_part(self, node, parent_col, world):
+        """Flatten an entire physical-part subtree (faces + edgebanding +
+        boring/dado) into one shared part-type collection and queue the
+        resulting objects to be joined into a single object."""
+        primary = self._pick_primary_name(node)
+        col     = self._get_or_create_col(parent_col, primary)
+        objs    = []
+        self._collect_part_objects(node, world, primary, col, objs)
+        if len(objs) > 1:
+            self._join_groups.append(objs)
+
+    def _collect_part_objects(self, node, world, obj_name, col, objs):
+        """Recursively build every mesh/light under `node` (regardless of
+        further PA_/VN_ nesting) into `col`, all sharing `obj_name` so they
+        join into a single object afterward. `world` is node's own already-
+        resolved world matrix."""
+        for inst in node["ginst"]:
+            gdata = self.p.geometries.get(inst["gid"])
+            if gdata is None:
+                _log("WARNING: geometry '%s' not found" % inst["gid"])
+                continue
+            obj = self._make_mesh(gdata, obj_name, inst["mmap"], world)
+            if obj:
+                col.objects.link(obj)
+                objs.append(obj)
+        for lid in node.get("linst", []):
+            ldict = self.p.lights.get(lid)
+            if ldict is None:
+                _log("WARNING: light '%s' not found" % lid)
+                continue
+            obj = self._make_light(ldict, obj_name, world)
+            if obj:
+                col.objects.link(obj)
+        for ch in node["children"]:
+            self._collect_part_objects(ch, world @ ch["mat"], obj_name, col, objs)
+
     def _build_node(self, node, parent_col, parent_world):
         world = parent_world @ node["mat"]
         name  = node["name"]
@@ -461,22 +641,50 @@ class BlenderBuilder:
                 self._build_node(ch, bore_col, world)
             return
 
-        # PA_ assembly wrappers: transparent pass-through — no collection of
-        # their own.  Recurse children straight into parent_col.
+        # PA_ assembly wrappers.
+        #
+        # If this wrapper's own direct children already include real panel
+        # geometry (faces/edgebanding), and every nested PA_ child
+        # underneath it contributes only boring/dado/notch features of
+        # that same panel (never an unrelated separate part), then this
+        # node is exactly "one physical part" — flatten its whole subtree
+        # and join everything into a single object.
+        #
+        # Otherwise this wrapper groups multiple distinct parts/sub-
+        # assemblies (a cabinet, a countertop, a run of cabinets, a room,
+        # ...) — Cabinet Vision nests many of these anonymous PA_ levels
+        # on top of each other. Each one gets its own collection so every
+        # part stays associated with the assembly (and the assembly's own
+        # parent grouping) it actually belongs to, instead of same-named
+        # parts from every assembly in the file pooling together the
+        # moment a PA_ wrapper is skipped as "just a pass-through."
         if name.startswith("PA_") and not node["ginst"]:
+            if (self._join_parts and node["children"]
+                    and self._is_physical_part_root(node)):
+                self._build_physical_part(node, parent_col, world)
+                return
+            if self._join_parts and node["children"]:
+                asm_col = bpy.data.collections.new(self._pick_assembly_name(node))
+                parent_col.children.link(asm_col)
+                for ch in node["children"]:
+                    self._build_node(ch, asm_col, world)
+                return
             for ch in node["children"]:
                 self._build_node(ch, parent_col, world)
             return
 
         # If this wrapper node has no direct geometry and all children have
         # clean CV part names, collapse: group each part type into one shared
-        # collection inside parent_col instead of one collection per instance.
+        # collection inside this node's OWN collection (not parent_col --
+        # otherwise same-named parts from sibling nodes elsewhere in the
+        # file would pool together and lose their association with `node`).
         if (not node["ginst"] and node["children"] and
                 all(not ch["name"].startswith(("VN_", "PA_"))
                     for ch in node["children"])):
+            own_col = self._get_or_create_col(parent_col, name)
             per_type = {}
             for ch in node["children"]:
-                part_col = self._get_or_create_col(parent_col, ch["name"])
+                part_col = self._get_or_create_col(own_col, ch["name"])
                 before   = {o.name for o in part_col.objects}
                 self._build_node(ch, part_col, world)
                 new_objs = [o for o in part_col.objects if o.name not in before]
@@ -532,13 +740,17 @@ class BlenderBuilder:
         return obj
 
     def join_part_groups(self, context):
-        """Join sub-mesh objects that belong to the same physical part instance."""
+        """Join sub-mesh objects that belong to the same physical part
+        instance, then weld the duplicate seam vertices that join leaves
+        behind (each face/edgeband/bore was built from its own separate
+        vertex list, so coincident points aren't shared until merged)."""
         if not self._join_groups:
             return
         vl   = context.view_layer
         prev = vl.objects.active
         for o in list(context.selected_objects):
             o.select_set(False)
+        joined = []
         for group in self._join_groups:
             valid = [o for o in group if o.name in vl.objects]
             if len(valid) < 2:
@@ -548,10 +760,76 @@ class BlenderBuilder:
                 o.select_set(True)
             try:
                 bpy.ops.object.join()
+                joined.append(valid[0])
             except Exception as exc:
                 _log("join failed: %s" % exc)
             valid[0].select_set(False)
         vl.objects.active = prev
+        self._joined_objects = joined
+        if self._merge_distance:
+            self._merge_by_distance(joined)
+
+    def clean_topology(self, angle_limit=math.radians(5.0)):
+        """Optional post-process, off by default: on each object that was
+        just joined, dissolve edges between near-coplanar faces (Limited
+        Dissolve) and merge the remaining triangles into quads (Tris to
+        Quads). Bore holes are tessellated by CV as fans of small
+        triangles; on the flat panel area around them this collapses a lot
+        of redundant triangulation into far fewer faces.
+
+        This only removes/merges edges — it does not move any vertex
+        position — but it DOES change how many faces bound a hole (e.g. a
+        16-gon bore wall may become fewer, larger faces), so it's opt-in
+        rather than automatic: leave it off if something downstream
+        depends on the exact triangulation Cabinet Vision exported."""
+        objs = getattr(self, "_joined_objects", [])
+        if not objs:
+            return
+        n_faces_before = n_faces_after = 0
+        for obj in objs:
+            if obj.type != "MESH":
+                continue
+            bm = bmesh.new()
+            bm.from_mesh(obj.data)
+            n_faces_before += len(bm.faces)
+            bmesh.ops.dissolve_limit(
+                bm, angle_limit=angle_limit, use_dissolve_boundaries=False,
+                verts=bm.verts, edges=bm.edges)
+            bmesh.ops.join_triangles(
+                bm, faces=bm.faces,
+                angle_face_threshold=math.radians(40),
+                angle_shape_threshold=math.radians(40))
+            n_faces_after += len(bm.faces)
+            bm.to_mesh(obj.data)
+            bm.free()
+            obj.data.update()
+        if objs:
+            _log("Clean topology: %d -> %d faces across %d joined objects" % (
+                n_faces_before, n_faces_after, len(objs)))
+
+    def _merge_by_distance(self, objs):
+        """Weld vertices within self._merge_distance of each other on each
+        object, via bmesh (no edit-mode/context override needed). This is
+        the automated equivalent of Mesh > Clean Up > Merge by Distance,
+        run only on the objects that were just joined."""
+        dist = self._merge_distance
+        total_removed = 0
+        for obj in objs:
+            if obj.type != "MESH":
+                continue
+            bm = bmesh.new()
+            bm.from_mesh(obj.data)
+            before = len(bm.verts)
+            bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=dist)
+            removed = before - len(bm.verts)
+            if removed:
+                bm.to_mesh(obj.data)
+                obj.data.update()
+                total_removed += removed
+            bm.free()
+        if total_removed:
+            _log("Merge by distance: welded %d duplicate vertices across %d objects" % (
+                total_removed, len(objs)))
 
     def _make_mesh(self, gdata, obj_name, mmap, world):
         sources  = gdata["sources"]
@@ -841,6 +1119,31 @@ class IMPORT_OT_cabinet_vision_dae(Operator, ImportHelper):
         name="Flip UV (V axis)",
         description="Enable if textures appear upside-down",
         default=False)
+    join_parts:  BoolProperty(
+        name="Join Panel Parts",
+        description=("Merge each physical part's faces, edgebanding, and "
+                      "boring/dado into a single selectable object"),
+        default=True)
+    merge_by_distance: BoolProperty(
+        name="Merge Vertices by Distance",
+        description=("After joining, weld duplicate seam vertices left "
+                      "over from joining independently-tessellated faces, "
+                      "edgebanding and boring (equivalent to Mesh > Clean "
+                      "Up > Merge by Distance, run automatically)"),
+        default=True)
+    merge_distance: FloatProperty(
+        name="Distance",
+        description="Vertices closer than this are welded together",
+        default=0.0001, min=0.0, precision=5, unit="LENGTH")
+    clean_topology: BoolProperty(
+        name="Clean Topology (Limited Dissolve + Tris to Quads)",
+        description=("On each joined object, dissolve edges between near-"
+                      "coplanar triangulated faces and merge remaining "
+                      "triangles into quads. Off by default: this changes "
+                      "how many faces bound a bore hole (though it never "
+                      "moves a vertex), which matters if anything "
+                      "downstream depends on CV's exact triangulation"),
+        default=False)
 
     def execute(self, context):
         _log("="*60)
@@ -849,9 +1152,13 @@ class IMPORT_OT_cabinet_vision_dae(Operator, ImportHelper):
         try:
             p = DAEParser(self.filepath)
             p.parse()
-            b = BlenderBuilder(p, report_fn=warnings.append)
+            dist = self.merge_distance if self.merge_by_distance else 0.0
+            b = BlenderBuilder(p, report_fn=warnings.append,
+                                join_parts=self.join_parts, merge_distance=dist)
             b.build(context)
             b.join_part_groups(context)
+            if self.clean_topology:
+                b.clean_topology()
             if self.flip_uv_v:
                 for obj in context.scene.objects:
                     if obj.type=="MESH" and obj.data.uv_layers:
@@ -870,7 +1177,14 @@ class IMPORT_OT_cabinet_vision_dae(Operator, ImportHelper):
         return {"FINISHED"}
 
     def draw(self, context):
-        self.layout.prop(self, "flip_uv_v")
+        layout = self.layout
+        layout.prop(self, "join_parts")
+        layout.prop(self, "merge_by_distance")
+        dist_row = layout.row()
+        dist_row.enabled = self.merge_by_distance
+        dist_row.prop(self, "merge_distance")
+        layout.prop(self, "clean_topology")
+        layout.prop(self, "flip_uv_v")
 
 # ──────────────────────────────────────────────────────────────
 #  Register
