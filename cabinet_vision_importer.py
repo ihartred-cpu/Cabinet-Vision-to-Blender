@@ -5,6 +5,51 @@
 #  Diagnostic output: Window > Toggle System Console (Windows)
 #
 #  CHANGELOG
+#  1.14.0 - New opt-in "Mark Hard Edges as Seams" post-process (on by
+#           default): marks every edge where the two adjacent faces meet
+#           at more than ~40 degrees as a UV seam, on every mesh object
+#           created by the import. Cabinet Vision panels are almost
+#           entirely rectilinear, so this lands seams right where a face
+#           actually turns a corner -- panel face to edgeband, panel face
+#           to a merged bore's cylinder wall -- giving a later UV unwrap
+#           sensible cut lines without hand-marking every part. Boundary
+#           edges (only one adjacent face) are left alone. Only sets edge
+#           seam flags; doesn't move geometry or touch existing UVs.
+#  1.13.0 - Two collection-grouping fixes so parts consolidate the way a
+#           person expects to browse them in the outliner:
+#           * Assembly collections (e.g. "Tall Cabinet Assembly") are now
+#             reused instead of always creating a new one. Cabinet Vision
+#             stacks multiple anonymous PA_ wrapper levels for what's
+#             conceptually one assembly; previously each level created
+#             its own collection, fragmenting one assembly's parts across
+#             "Tall Cabinet Assembly", "Tall Cabinet Assembly.001", ".002",
+#             etc. Now every part belonging to that assembly -- across
+#             however many stacked PA_ levels CV emitted, and regardless
+#             of which of the two build paths (physical-part merge vs.
+#             clean-collapse) picked it up -- lands in one shared
+#             collection, so e.g. every "AS" (adjustable shelf) in an
+#             assembly ends up in one "AS" collection instead of several.
+#           * Bore sub-types (LFVBORE, LRVBORE, _HGCVBORE, _HGAVBORE, and
+#             CV's dozens of other bore type codes) that don't get
+#             absorbed into a panel now share one common "Bores"
+#             collection per assembly instead of each getting its own
+#             collection named after its literal sub-type code.
+#  1.12.0 - Fixed mangled/mismatched UVs on panels with shelf-pin or
+#           hinge bores (commonly visible on End/Top/Bottom panels): CV
+#           exports each bore as its own separately-tessellated cylinder
+#           with a UV parameterization that doesn't match the flat panel
+#           it's drilled into. A 90-degree UV rotation to correct this
+#           already existed, but it only checked the *merged mesh
+#           object's* own name for a "BORE" suffix -- which worked back
+#           when a bore stayed its own standalone object, but silently
+#           stopped firing once 1.9.0-1.11.0 started joining bore
+#           instances directly into the panel's merged mesh (named after
+#           the panel, e.g. "TO"/"SL"/"BT", not the bore). The bore's raw,
+#           misaligned UV then flowed straight into the panel mesh
+#           untouched. Now applied per contributing instance instead of
+#           per merged object, so it fires regardless of what the merged
+#           object ends up named. Verified directly against a live
+#           "hall out.dae" import (decoded geometry names/counts).
 #  1.11.0 - 1.10.0's bore-absorption only covered bores exported as flat
 #           siblings under a bare (non-PA_) grouping node. In practice
 #           Cabinet Vision often wraps a bore in its own PA_+VN_ pair --
@@ -92,7 +137,7 @@
 bl_info = {
     "name": "Cabinet Vision DAE Importer",
     "author": "Custom",
-    "version": (1, 11, 0),
+    "version": (1, 14, 0),
     "blender": (4, 0, 0),
     "location": "File > Import > Cabinet Vision (.dae)",
     "description": "Import Cabinet Vision Collada exports with correct geometry, materials, UVs, hierarchy, and joined physical parts",
@@ -664,6 +709,19 @@ class BlenderBuilder:
         parent_col.children.link(col)
         return col
 
+    @staticmethod
+    def _collection_key(part_name):
+        """Collection-grouping key for a part-type name. Every *BORE
+        sub-type (LFVBORE, LRVBORE, _HGCVBORE, _HGAVBORE, ...) shares one
+        common "Bores" collection per assembly instead of each fragmenting
+        into its own separately-named collection -- Cabinet Vision has
+        dozens of distinct bore type codes, and grouping them by their
+        literal name scatters what a person thinks of as one thing (the
+        shelf-pin/hinge boring for this assembly) across many collections.
+        Non-bore part types (e.g. "AS") are grouped by their own name, one
+        shared collection per assembly, unchanged."""
+        return "Bores" if "BORE" in part_name.upper() else part_name
+
     # ── physical-part detection ─────────────────────────────────────────
 
     def _gather_leaf_names(self, node, out):
@@ -1016,8 +1074,14 @@ class BlenderBuilder:
         has_uvs = False
         offset = 0
         used = 0
+        bore_uv_ranges = []
 
-        for dec, world, mmap in instances:
+        for entry in instances:
+            if len(entry) == 4:
+                dec, world, mmap, inst_name = entry
+            else:
+                dec, world, mmap = entry
+                inst_name = name
             if dec is None or not dec["faces"]:
                 continue
             v = self._xform(dec["pos"], world)
@@ -1026,11 +1090,14 @@ class BlenderBuilder:
                 faces.extend(tuple(i + offset for i in f) for f in dec["faces"])
             else:
                 faces.extend(dec["faces"])
+            uv_start = len(uv_pairs)
             for f, fuv in zip(dec["faces"], dec["uvs"]):
                 if fuv:
                     uv_pairs.extend(fuv)
                 else:
                     uv_pairs.extend((0.0, 0.0) for _ in f)
+            if inst_name.upper().endswith("BORE"):
+                bore_uv_ranges.append((uv_start, len(uv_pairs)))
             for s in dec["syms"]:
                 mids.append(mmap.get(s, ""))
             has_uvs = has_uvs or dec["has_uvs"]
@@ -1048,9 +1115,19 @@ class BlenderBuilder:
         if has_uvs:
             layer = mesh.uv_layers.new(name="UVMap")
             uv = np.asarray(uv_pairs, dtype=np.float32)
-            # Bore objects need their UV map rotated 90 degrees
-            if name.upper().endswith("BORE"):
-                uv = np.column_stack((1.0 - uv[:, 1], uv[:, 0]))  # 90 deg CCW
+            # Bore geometry's own UV parameterization needs a 90-degree
+            # rotation to align with the surrounding panel/material. This
+            # used to be gated on the whole merged object's name ending in
+            # "BORE", which only ever fired when a bore stayed its own
+            # standalone object. Since v1.9.0+ joins bore instances into
+            # the panel's own merged mesh (named after the panel, e.g.
+            # "TO"/"SL"/"BT"), that check silently stopped firing for the
+            # far more common merged case, leaving bore UVs unrotated and
+            # visibly mismatched ("mangled") against the panel's grain.
+            # Apply the rotation per contributing instance instead, so it
+            # fires regardless of what the merged object ends up named.
+            for lo, hi in bore_uv_ranges:
+                uv[lo:hi] = np.column_stack((1.0 - uv[lo:hi, 1], uv[lo:hi, 0]))  # 90 deg CCW
             layer.data.foreach_set("uv", uv.ravel())
 
         # Material slots: one per distinct material id actually used.
@@ -1119,7 +1196,7 @@ class BlenderBuilder:
                 self._gather_instances(ch, world @ ch["mat"], meshes, lights)
             return
         for inst in node["ginst"]:
-            meshes.append((self._decode_geometry(inst["gid"]), world, inst["mmap"]))
+            meshes.append((self._decode_geometry(inst["gid"]), world, inst["mmap"], node["name"]))
         for lid in node.get("linst", []):
             lights.append((lid, world))
         for ch in node["children"]:
@@ -1130,7 +1207,7 @@ class BlenderBuilder:
         boring/dado) directly as ONE mesh object in a shared part-type
         collection -- no temporary objects, no operator join."""
         primary = self._pick_primary_name(node)
-        col = self._get_or_create_col(parent_col, primary)
+        col = self._get_or_create_col(parent_col, self._collection_key(primary))
         meshes, lights = [], []
         self._gather_instances(node, world, meshes, lights)
         obj, used = self._build_mesh_object(primary, meshes)
@@ -1210,8 +1287,17 @@ class BlenderBuilder:
                 self._build_physical_part(node, parent_col, world)
                 return
             if self._join_parts and node["children"]:
-                asm_col = bpy.data.collections.new(self._pick_assembly_name(node))
-                parent_col.children.link(asm_col)
+                # Cabinet Vision stacks multiple anonymous PA_ wrapper
+                # levels for what's conceptually one assembly, each
+                # resolving to the same VN_-derived label (e.g. "Tall
+                # Cabinet Assembly"). Reuse an existing same-named
+                # collection under this parent instead of always creating
+                # a new one, so every part belonging to that assembly --
+                # across however many stacked PA_ levels CV emitted --
+                # lands in one shared collection instead of fragmenting
+                # into "Tall Cabinet Assembly", "Tall Cabinet
+                # Assembly.001", ".002", etc.
+                asm_col = self._get_or_create_col(parent_col, self._pick_assembly_name(node))
 
                 # Cabinet Vision sometimes exports a bore as its own
                 # PA_+VN_-wrapped sibling of the part it's actually
@@ -1285,7 +1371,11 @@ class BlenderBuilder:
             own_col = self._get_or_create_col(parent_col, name)
             per_type = {}
             for ch in node["children"]:
-                part_col = self._get_or_create_col(own_col, ch["name"])
+                # Grouped by _collection_key (bore sub-types share one
+                # "Bores" collection) for where the object actually lands;
+                # per_type below stays keyed by the real ch["name"] so the
+                # bore-absorption classification just below is unaffected.
+                part_col = self._get_or_create_col(own_col, self._collection_key(ch["name"]))
                 before = {o.name for o in part_col.objects}
                 self._build_node(ch, part_col, world)
                 new_objs = [o for o in part_col.objects if o.name not in before]
@@ -1455,6 +1545,38 @@ class BlenderBuilder:
             layer.foreach_get("uv", arr)
             arr[1::2] = 1.0 - arr[1::2]
             layer.foreach_set("uv", arr)
+
+    def mark_hard_edge_seams(self, angle_limit=math.radians(40.0)):
+        """On by default: mark every edge whose two adjacent faces meet at
+        more than `angle_limit` as a UV seam, on every mesh object created
+        by this import. Cabinet Vision panels are almost entirely
+        rectilinear, so this lands seams right where a face genuinely
+        turns a corner -- panel face to edgeband, panel face to a merged
+        bore's cylinder wall, and so on -- exactly where a later UV
+        unwrap (Smart UV Project or otherwise) should be cutting anyway,
+        without needing to hand-mark seams on every part.
+
+        Boundary edges (only one adjacent face -- an open edge where
+        nothing else was merged in, e.g. a lone unmerged panel) are left
+        alone: there's no second face to compare an angle against, and
+        marking every open boundary as a seam would over-segment simple
+        parts into far more islands than needed."""
+        n_seams = n_edges = 0
+        for obj in self._created_objects:
+            if obj.type != "MESH":
+                continue
+            bm = bmesh.new()
+            bm.from_mesh(obj.data)
+            n_edges += len(bm.edges)
+            for e in bm.edges:
+                if len(e.link_faces) == 2 and e.calc_face_angle() > angle_limit:
+                    e.seam = True
+                    n_seams += 1
+            bm.to_mesh(obj.data)
+            bm.free()
+            obj.data.update()
+        _log("Mark hard edges as seams: %d/%d edges marked across %d objects" % (
+            n_seams, n_edges, len(self._created_objects)))
 
     # ── hidden dado/notch cutting ───────────────────────────────────────
     #
@@ -1687,6 +1809,16 @@ class IMPORT_OT_cabinet_vision_dae(Operator, ImportHelper):
                      "this on, there's nothing left in the merged mesh "
                      "for that fix to find"),
         default=True)
+    mark_hard_edges: BoolProperty(
+        name="Mark Hard Edges as Seams",
+        description=("Mark every edge where two adjacent faces meet at "
+                     "more than ~40 degrees as a UV seam (panel face to "
+                     "edgeband, panel face to a merged bore's cylinder "
+                     "wall, etc.), so a later UV unwrap has sensible cut "
+                     "lines to work from without hand-marking every part. "
+                     "Only sets edge seam flags -- doesn't move any "
+                     "geometry or touch existing UVs by itself"),
+        default=True)
 
     def execute(self, context):
         import time
@@ -1710,6 +1842,8 @@ class IMPORT_OT_cabinet_vision_dae(Operator, ImportHelper):
                 b.fix_hidden_dado_faces()
             if self.flip_uv_v:
                 b.flip_uvs()
+            if self.mark_hard_edges:
+                b.mark_hard_edge_seams()
             for w in warnings:
                 self.report({"WARNING"}, w)
             msg = "Cabinet Vision import: %d geometries, %d materials in %.2fs" % (
@@ -1735,6 +1869,7 @@ class IMPORT_OT_cabinet_vision_dae(Operator, ImportHelper):
         layout.prop(self, "fix_hidden_dados")
         layout.prop(self, "hide_feature_parts")
         layout.prop(self, "flip_uv_v")
+        layout.prop(self, "mark_hard_edges")
 
 
 # ──────────────────────────────────────────────────────────────
