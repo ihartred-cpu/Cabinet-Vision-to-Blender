@@ -5,6 +5,25 @@
 #  Diagnostic output: Window > Toggle System Console (Windows)
 #
 #  CHANGELOG
+#  1.13.0 - Two collection-grouping fixes so parts consolidate the way a
+#           person expects to browse them in the outliner:
+#           * Assembly collections (e.g. "Tall Cabinet Assembly") are now
+#             reused instead of always creating a new one. Cabinet Vision
+#             stacks multiple anonymous PA_ wrapper levels for what's
+#             conceptually one assembly; previously each level created
+#             its own collection, fragmenting one assembly's parts across
+#             "Tall Cabinet Assembly", "Tall Cabinet Assembly.001", ".002",
+#             etc. Now every part belonging to that assembly -- across
+#             however many stacked PA_ levels CV emitted, and regardless
+#             of which of the two build paths (physical-part merge vs.
+#             clean-collapse) picked it up -- lands in one shared
+#             collection, so e.g. every "AS" (adjustable shelf) in an
+#             assembly ends up in one "AS" collection instead of several.
+#           * Bore sub-types (LFVBORE, LRVBORE, _HGCVBORE, _HGAVBORE, and
+#             CV's dozens of other bore type codes) that don't get
+#             absorbed into a panel now share one common "Bores"
+#             collection per assembly instead of each getting its own
+#             collection named after its literal sub-type code.
 #  1.12.0 - Fixed mangled/mismatched UVs on panels with shelf-pin or
 #           hinge bores (commonly visible on End/Top/Bottom panels): CV
 #           exports each bore as its own separately-tessellated cylinder
@@ -108,7 +127,7 @@
 bl_info = {
     "name": "Cabinet Vision DAE Importer",
     "author": "Custom",
-    "version": (1, 12, 0),
+    "version": (1, 13, 0),
     "blender": (4, 0, 0),
     "location": "File > Import > Cabinet Vision (.dae)",
     "description": "Import Cabinet Vision Collada exports with correct geometry, materials, UVs, hierarchy, and joined physical parts",
@@ -680,6 +699,19 @@ class BlenderBuilder:
         parent_col.children.link(col)
         return col
 
+    @staticmethod
+    def _collection_key(part_name):
+        """Collection-grouping key for a part-type name. Every *BORE
+        sub-type (LFVBORE, LRVBORE, _HGCVBORE, _HGAVBORE, ...) shares one
+        common "Bores" collection per assembly instead of each fragmenting
+        into its own separately-named collection -- Cabinet Vision has
+        dozens of distinct bore type codes, and grouping them by their
+        literal name scatters what a person thinks of as one thing (the
+        shelf-pin/hinge boring for this assembly) across many collections.
+        Non-bore part types (e.g. "AS") are grouped by their own name, one
+        shared collection per assembly, unchanged."""
+        return "Bores" if "BORE" in part_name.upper() else part_name
+
     # ── physical-part detection ─────────────────────────────────────────
 
     def _gather_leaf_names(self, node, out):
@@ -1165,7 +1197,7 @@ class BlenderBuilder:
         boring/dado) directly as ONE mesh object in a shared part-type
         collection -- no temporary objects, no operator join."""
         primary = self._pick_primary_name(node)
-        col = self._get_or_create_col(parent_col, primary)
+        col = self._get_or_create_col(parent_col, self._collection_key(primary))
         meshes, lights = [], []
         self._gather_instances(node, world, meshes, lights)
         obj, used = self._build_mesh_object(primary, meshes)
@@ -1245,8 +1277,17 @@ class BlenderBuilder:
                 self._build_physical_part(node, parent_col, world)
                 return
             if self._join_parts and node["children"]:
-                asm_col = bpy.data.collections.new(self._pick_assembly_name(node))
-                parent_col.children.link(asm_col)
+                # Cabinet Vision stacks multiple anonymous PA_ wrapper
+                # levels for what's conceptually one assembly, each
+                # resolving to the same VN_-derived label (e.g. "Tall
+                # Cabinet Assembly"). Reuse an existing same-named
+                # collection under this parent instead of always creating
+                # a new one, so every part belonging to that assembly --
+                # across however many stacked PA_ levels CV emitted --
+                # lands in one shared collection instead of fragmenting
+                # into "Tall Cabinet Assembly", "Tall Cabinet
+                # Assembly.001", ".002", etc.
+                asm_col = self._get_or_create_col(parent_col, self._pick_assembly_name(node))
 
                 # Cabinet Vision sometimes exports a bore as its own
                 # PA_+VN_-wrapped sibling of the part it's actually
@@ -1320,7 +1361,11 @@ class BlenderBuilder:
             own_col = self._get_or_create_col(parent_col, name)
             per_type = {}
             for ch in node["children"]:
-                part_col = self._get_or_create_col(own_col, ch["name"])
+                # Grouped by _collection_key (bore sub-types share one
+                # "Bores" collection) for where the object actually lands;
+                # per_type below stays keyed by the real ch["name"] so the
+                # bore-absorption classification just below is unaffected.
+                part_col = self._get_or_create_col(own_col, self._collection_key(ch["name"]))
                 before = {o.name for o in part_col.objects}
                 self._build_node(ch, part_col, world)
                 new_objs = [o for o in part_col.objects if o.name not in before]
