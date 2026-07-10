@@ -1,16 +1,18 @@
 # Cabinet Vision to Blender
 
-A Blender add-on that imports Cabinet Vision's Collada (`.dae`) exports as a clean, organized scene — correct geometry, materials, UVs, and lighting, with cabinets rebuilt as sensible, editable objects instead of a pile of disconnected meshes.
+A Blender add-on that imports Cabinet Vision's Collada (`.dae`) exports directly into a clean, organized Blender scene — correct geometry, materials, UVs, and lighting, with cabinets rebuilt as sensible, editable objects instead of a pile of disconnected meshes.
 
-Most Collada importers, including Blender's built-in one, just dump the raw scene graph: every face, edgeband, and bore/dado fragment lands as its own disconnected object. This add-on understands Cabinet Vision's specific export structure, so it reconstructs what CV actually meant:
+Most Collada importers (including Blender's built-in one) just dump the raw scene graph: every face, edgeband strip, and boring/dado/notch fragment comes in as its own separate object, with no regard for which panel or cabinet it belongs to, and re-decode the same geometry from scratch every time it's instanced. This add-on is built specifically around how Cabinet Vision structures its Collada exports, so it can reconstruct what CV actually meant, and do it fast:
 
-- **Joined, welded parts** — each panel's faces, edgebanding, and boring/dado merge into one selectable object, with seams welded automatically.
-- **Assembly-aware collections** — parts are grouped and named after their actual CV assembly (e.g. "Base Cabinet Assembly"), instead of pooling same-named parts from across the whole file.
-- **Hardware-aware bore handling** — bores exported as loose siblings (e.g. hinge bores) are matched to the correct part rather than hinge hardware; an opt-in fix can also expose dado/notch pockets CV leaves hidden behind an uncut face.
-- **Fast on real jobs** — geometry is decoded and cached once per instance instead of re-parsed, parts build directly into their final mesh instead of via temp-object-then-join, and heavy lifting runs through numpy.
-- **Optional cleanup pass** — an off-by-default topology cleanup for over-triangulated faces; left off because it changes bore-hole triangulation.
+- **Joined parts** — each physical panel's faces, edgebanding, and boring/dado are recognized as one unit and built directly into a single, selectable object, with duplicate seam vertices automatically welded.
+- **Assembly-aware collections** — parts stay grouped under their own cabinet/countertop/molding run, in a collection named from Cabinet Vision's own label (e.g. "Base Cabinet Assembly"), instead of every same-named part across the whole file getting pooled together. Cabinet Vision often stacks several anonymous wrapper levels for what's conceptually one assembly; those are now collapsed into a single shared collection too, so e.g. every adjustable shelf ("AS") in an assembly lands in one "AS" collection instead of fragmenting across several duplicate-looking ones.
+- **Hardware-aware bore handling** — hinge-cup/screw bores and similar operations that Cabinet Vision exports as flat siblings of the part they're drilled into (instead of nested the normal way) are recognized and absorbed into the one real structural part in that group, without touching the separate hinge hardware (arm/base plate) sitting alongside them. Bore geometry's own UV parameterization is corrected to align with the panel it ends up merged into, so drilled holes don't show up as mismatched or rotated texture. Any bore that can't be confidently absorbed into a panel shares one common "Bores" collection per assembly instead of scattering across a separate collection per bore sub-type code. Nested dado/notch pockets are routed to a hidden collection by default since they're usually redundant duplicate geometry, while boring/drilling geometry always stays merged and visible in the panel, matching what's actually cut into it.
+- **Hidden-feature repair** — an opt-in "Fix Hidden Dado/Notch Faces" pass catches panels where CV builds a correct recessed pocket but exports an unbroken face covering it, and cuts away just the covering portion so the pocket is actually visible.
+- **Built for CV's real export sizes** — each geometry is decoded from the XML once and cached, instead of being re-parsed every time CV instances the same panel or bore across a job; parts are assembled directly into their final mesh instead of spawning dozens of temporary objects per part and running Blender's Join operator on each group; and UVs, material indices, and vertex transforms are written in bulk (numpy / `foreach_set`) instead of per-vertex Python loops. Large jobs that would grind a generic importer to a crawl import quickly.
+- **Optional clean topology pass** — a Limited Dissolve + Tris to Quads step that tidies up flat, over-triangulated faces without moving any vertex positions. Off by default: it does change how many faces bound a bore hole, which matters if anything downstream depends on CV's exact triangulation.
+- **Hard edges marked as UV seams** — on by default, every edge where two adjacent faces meet at more than ~40° (panel face to edgeband, panel face to a merged bore's cylinder wall, and so on) gets marked as a seam, so a later UV unwrap has sensible cut lines to work from without hand-marking every part. Only sets the seam flag; doesn't move geometry or touch existing UVs.
 
-Tested in Blender 4.5.7 and 5.1+ (should work back to 4.0). CV's `.dae` export must be UTF-8, not ANSI/Unicode.
+Tested in Blender 4.5.7 and 5.1+, and should work back to 4.0. Note: the CV `.dae` export must be saved as UTF-8, not ANSI/Unicode.
 
 ![Cabinet Vision](https://github.com/ihartred-cpu/Cabinet-Vision-to-Blender/blob/main/Screenshot%202026-06-30%20123044.png)
 
@@ -24,38 +26,47 @@ Tested in Blender 4.5.7 and 5.1+ (should work back to 4.0). CV's `.dae` export m
 
 ## Changelog
 
+### 1.14.0
+- New opt-in "Mark Hard Edges as Seams" post-process (on by default): marks every edge where the two adjacent faces meet at more than ~40 degrees as a UV seam, on every mesh object created by the import. Cabinet Vision panels are almost entirely rectilinear, so this lands seams right where a face actually turns a corner -- panel face to edgeband, panel face to a merged bore's cylinder wall -- giving a later UV unwrap sensible cut lines without hand-marking every part. Boundary edges (only one adjacent face) are left alone. Only sets edge seam flags; doesn't move geometry or touch existing UVs.
+
+### 1.13.0
+- Two collection-grouping fixes so parts consolidate the way you'd expect to browse them in the outliner. Assembly collections (e.g. "Tall Cabinet Assembly") are now reused instead of always creating a new one -- Cabinet Vision stacks multiple anonymous wrapper levels for what's conceptually one assembly, which previously fragmented one assembly's parts across "Tall Cabinet Assembly", "Tall Cabinet Assembly.001", ".002", etc. Now everything belonging to one assembly lands in one shared collection, regardless of which of the two build paths picked it up. Bore sub-types (`LFVBORE`, `LRVBORE`, `_HGCVBORE`, `_HGAVBORE`, and CV's dozens of other bore type codes) that don't get absorbed into a panel now share one common "Bores" collection per assembly instead of each getting its own collection named after its literal sub-type code.
+
+### 1.12.0
+- Fixed mangled/mismatched UVs on panels with shelf-pin or hinge bores (most visible on End/Top/Bottom panels): Cabinet Vision exports each bore as its own separately-tessellated cylinder with a UV parameterization that doesn't match the flat panel it's drilled into. A 90-degree UV rotation to correct this already existed, but it only checked the *merged mesh object's* own name for a "BORE" suffix -- which worked when a bore stayed its own standalone object, but silently stopped firing once 1.9.0-1.11.0 started joining bore instances directly into the panel's merged mesh (named after the panel, e.g. "TO"/"SL"/"BT", not the bore). The bore's raw, misaligned UV was flowing straight into the panel mesh untouched. Now applied per contributing instance instead of per merged object, so it fires regardless of what the merged object ends up named.
+
 ### 1.11.0
-- Extended 1.10.0's bore-absorption to bores wrapped in their own `PA_`+`VN_` pair (e.g. hinge bores sibling to a door's real slab wrapper), excluding hinge hardware ("Widget_*") as a valid target.
+- 1.10.0's bore-absorption only covered bores exported as flat siblings under a bare (non-`PA_`) grouping node. Cabinet Vision often instead wraps a bore in its own `PA_`+`VN_` pair -- e.g. hinge bores ("_HGAVBORE"/"_HGCVBORE") showing up under their own "Molding_Door_NN" wrapper, sibling to the door's real "Door_NN" slab wrapper and to separate hinge-hardware ("Widget_Arm"/"Widget_Base_Plate") wrappers -- which 1.10.0 didn't reach. Extended the same "exactly one structural target absorbs every bore-only sibling" logic to this assembly level too, additionally excluding any "Widget"-labeled sibling (hinge arm/base hardware) from ever being a valid absorption target.
 
 ### 1.10.0
-- Bores exported as flat siblings of the part they're drilled into (e.g. hinge-cup/screw bores) now join into that part automatically, when exactly one unambiguous target exists.
+- Bore operations (e.g. "_HGAVBORE" hinge-cup/screw bores) that Cabinet Vision exports as flat siblings of the part they're drilled into -- rather than nested inside it the way panel cuts normally are -- previously stayed unmerged, floating as their own separate objects instead of becoming part of the door/drawer-front they belong to. When exactly one non-feature leaf part exists among such a group of siblings, every bore-type object in that group is now joined into it; hinge hardware and any ambiguous (multiple-candidate) groupings are left untouched to avoid an incorrect merge.
 
 ### 1.9.1
-- Fixed 1.9.0's hide logic also catching BORE nodes. Hiding now only applies to DADO/NOTCH; BORE geometry stays merged and visible.
+- "Hide Dado/Notch Feature Geometry" (1.9.0) was also catching BORE-named nodes, hiding boring/drilling geometry along with the dado/notch pockets. Split the keyword set so hiding only ever applies to DADO/NOTCH; BORE geometry always stays merged and visible in the panel mesh, same as before 1.9.0.
 
 ### 1.9.0
-- Fixed a long-standing bug: BORE/DADO/NOTCH geometry nested inside its panel was silently merged in instead of reaching the "hide standalone features" logic. New "Hide Bore/Dado/Notch Feature Geometry" option (on by default) routes it to the hidden collection instead.
+- Fixed a real bug (present since 1.4.0's part-joining, not something 1.8.0's rewrite introduced): BORE/DADO/NOTCH feature geometry nested inside the panel it cuts into (the normal, documented case -- e.g. "UBDADO", "_HGAVBORE") was being silently fused into that panel's merged mesh instead of ever reaching the "hide standalone feature objects" logic added in 1.7.0, which only ever fired for the rarer case of a feature exported as an un-nestable orphan sibling. New "Hide Bore/Dado/Notch Feature Geometry" checkbox (on by default) now catches the nested case too, routing that geometry straight to the hidden "CV Hidden Features" collection instead of merging it in.
 
 ### 1.8.0
-- Performance/organization rewrite: geometry decoded and cached once per unique instance, parts built directly instead of via temp-object-then-join, UVs/material indices/transforms written in bulk via numpy, texture search cached.
-- Fixes: UV flip now scoped to this import's own objects, unknown materials share one fallback datablock, import errors log a full traceback.
+- Performance/organization rewrite. Import is much faster on large files: each geometry is decoded from XML exactly once and cached, instead of being fully re-parsed for every instance that references it (Cabinet Vision instances the same panel/bore geometry many times across a job). Physical parts are assembled directly into a single mesh at build time, instead of creating dozens of temporary objects per part and running the slow, selection-based Join operator on each group (the operator join is now kept only for the rarer clean-named collapse path). UVs and material indices are written with `foreach_set` instead of per-loop Python assignment, and vertex transforms go through numpy. The recursive fallback texture search walks the export directory once and caches a filename index, instead of re-walking the tree for every missing texture.
+- Behavior fixes: "Flip UV (V axis)" now only affects objects created by this import -- it used to flip every mesh already in the scene. Unknown-material slots share one "CV_Unknown" material instead of creating a new datablock per object. Import errors now print a full traceback to the console.
 
 ### 1.7.0
-- Added opt-in "Fix Hidden Dado/Notch Faces": exposes dado/notch pockets CV builds correctly but leaves covered by an uncut face.
-- Standalone dado/notch/bore reference objects now move to the hidden collection instead of importing as visible clutter.
+- Some panels (typically uprights with a dado/groove cut into their interior face, as opposed to a rabbet cut from an edge) import with the cut invisible: Cabinet Vision correctly builds the recessed floor and side walls of the pocket, but exports the panel's own large flat face without a hole for it, so the real pocket geometry sits, unseen, directly behind a solid unbroken face. New opt-in "Fix Hidden Dado/Notch Faces" checkbox scans each joined part for exactly this signature (a large flat face fully covering a much smaller, near-coincident, parallel face) and cuts away just the covering portion, exposing the pocket that was already there. Off by default since it deletes geometry -- turn it on when a part looks like it's missing a dado/notch that should be visible.
+- Standalone DADO/NOTCH/BORE reference objects that Cabinet Vision emits as their own siblings (rather than nested inside the one panel they cut into, so they can't be joined into it) previously imported as ordinary visible parts cluttering the scene; they now move into the same hidden collection as bore hardware.
 
 ### 1.6.0
-- Collections now preserve each part's assembly association instead of pooling same-named parts across the whole file.
-- Fixed "Merge Vertices by Distance" toggle being squeezed out of the import panel.
+- Collections now preserve each part's association with its assembly. Previously, once part names were "clean" (no `VN_`/`PA_` prefix), same-named parts from every assembly in the whole file (every "RU", every "LU", ...) were pooled into one shared collection, losing which cabinet/countertop/molding run each part belonged to. Each physical assembly (identified as the shallowest point where distinct parts appear as direct children) now gets its own collection — named from Cabinet Vision's own label where available (e.g. "Base Cabinet Assembly") — with its part collections nested inside it.
+- Fixed the "Merge Vertices by Distance" toggle not being visible/reachable in the import options panel: it shared a row with the distance field, which could get squeezed out of a narrow panel. Each option now gets its own full-width row.
 
 ### 1.5.0
-- Added optional "Clean Topology" post-process (Limited Dissolve + Tris to Quads), off by default since it changes bore-hole triangulation.
+- Added an optional "Clean Topology" post-process (Limited Dissolve + Tris to Quads) on joined objects, off by default. Removes redundant edges on flat, near-coplanar triangulated faces without moving vertex positions. Left off by default because it changes face/edge topology near bore holes, which matters if anything downstream depends on the exact triangulation CV exported.
 
 ### 1.4.1
-- Added automatic "Merge Vertices by Distance" after joining, to weld duplicate seam vertices left over from merging.
+- Added automatic "Merge Vertices by Distance" after joining, to weld the duplicate seam vertices that joining leaves behind (each face/edgeband/bore was built from its own separate vertex list, so coincident points aren't shared until merged).
 
 ### 1.4.0
-- Physical parts (faces + edgebanding + boring/dado) now join into one selectable object per panel instance.
+- Physical parts (faces + edgebanding + boring/dado) are now recognized as a single unit and joined into one selectable object per panel instance, instead of staying as many separate un-joined objects.
 
 ### 1.3.0
 - Baseline release: correct geometry, materials, UVs, and hierarchy on import.
