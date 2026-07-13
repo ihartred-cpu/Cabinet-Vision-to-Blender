@@ -1,6 +1,6 @@
 # Cabinet Vision to Blender
 
-Cabinet Vision, in its wisdom, exports to Collada (`.dae`) — a fine, uh, *time-honored* choice — and the results are about what you'd expect: every face, edgeband strip, and dado fragment arrives as its own disconnected object, with zero regard for which panel or cabinet it belongs to. This add-on makes the best of it: CV's `.dae` exports come in as a proper Blender scene — correct geometry, materials, UVs, lighting — with cabinets rebuilt as sensible, editable objects instead of a debris field of meshes.
+Cabinet Vision, in its wisdom, exports to Collada (`.dae`) — a fine, *time-honored* choice — and the results are about what you'd expect: every face, edgeband strip, and dado fragment arrives as its own disconnected object, with zero regard for which panel or cabinet it belongs to. This add-on makes the best of it: CV's `.dae` exports come in as a proper Blender scene — correct geometry, materials, UVs, lighting — with cabinets rebuilt as sensible, editable objects instead of a debris field of meshes.
 
 ## Features
 
