@@ -1,7 +1,5 @@
 # Cabinet Vision to Blender
 
-Cabinet Vision, in its wisdom, exports to Collada (`.dae`) — a fine, *time-honored* choice — and the results are about what you'd expect: every face, edgeband strip, and dado fragment arrives as its own disconnected object, with zero regard for which panel or cabinet it belongs to. This add-on makes the best of it: CV's `.dae` exports come in as a proper Blender scene — correct geometry, materials, UVs, lighting — with cabinets rebuilt as sensible, editable objects instead of a debris field of meshes.
-
 ## Features
 
 - **Joined parts** — each panel's faces, edgebanding, and boring/dado become one selectable object, seams welded.
@@ -23,6 +21,17 @@ Tested in Blender 4.5.7 and 5.1+, should work back to 4.0. CV `.dae` export must
 ![CV](https://github.com/ihartred-cpu/Cabinet-Vision-to-Blender/blob/main/Screenshot%202026-07-01%20094204.png)
 
 ![Blender](https://github.com/ihartred-cpu/Cabinet-Vision-to-Blender/blob/main/Screenshot%202026-07-06%20095110.png)
+
+## Why other DAE importers fail on CV files
+
+Collada 1.4 is a broad spec designed for complete scene interchange. In practice, every available importer was built for the game/character pipeline — a mesh, some bones, some textures — and only implemented that shallow subset.
+
+CV is a precision manufacturing CAD system that uses Collada the way it was actually designed to be used. Two spec features it relies on are ones no game exporter ever needed, so no importer ever bothered to parse them:
+
+- **`<library_nodes>` + `<instance_node>`** — define a part once, instance it across an assembly. Generic importers see the visual scene, find no geometry directly in it, and produce nothing.
+- **`<polygons>/<ph>/<h>`** — polygon-with-holes, used for panel faces with hardware bores or routed cutouts. Game meshes are pre-triangulated; nobody in that pipeline ever produces this, so nobody parses it. The result is solid panels with no cutouts.
+
+The gap isn't CV doing something wrong — it's that the rest of the world never went past triangles and bones.
 
 ## Changelog
 
